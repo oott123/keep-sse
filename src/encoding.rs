@@ -60,7 +60,7 @@ impl Coding {
     }
 }
 
-/// 解析响应的 `Content-Encoding`。无头视为 `Identity`；多重编码或未知编码返回 `None`。
+/// 解析请求或响应的 `Content-Encoding`。无头视为 `Identity`；多重编码或未知编码返回 `None`。
 pub fn parse_content_encoding(headers: &HeaderMap) -> Option<Coding> {
     let mut iter = headers.get_all(http::header::CONTENT_ENCODING).iter();
     let first = match iter.next() {
@@ -148,21 +148,37 @@ pub fn negotiate(accept_encoding: Option<&str>) -> Coding {
     Coding::Identity
 }
 
-/// 一次性解压（探测与错误体读取用）。
-pub async fn decode_bytes(coding: Coding, input: &[u8]) -> io::Result<Vec<u8>> {
+/// 一次性解压（探测与错误体读取用）。解压输出上限 `max_out` 字节，超出返回 `InvalidData`。
+pub async fn decode_bytes(coding: Coding, input: &[u8], max_out: usize) -> io::Result<Vec<u8>> {
     match coding {
-        Coding::Identity => Ok(input.to_vec()),
-        Coding::Gzip => decode_async(GzBuf::new(input)).await,
-        Coding::Deflate => decode_async(DeflBuf::new(input)).await,
-        Coding::Br => decode_async(BrBuf::new(input)).await,
-        Coding::Zstd => decode_async(ZstBuf::new(input)).await,
+        Coding::Identity => {
+            if input.len() > max_out {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("decoded size {} exceeds limit {}", input.len(), max_out),
+                ));
+            }
+            Ok(input.to_vec())
+        }
+        Coding::Gzip => decode_async(GzBuf::new(input), max_out).await,
+        Coding::Deflate => decode_async(DeflBuf::new(input), max_out).await,
+        Coding::Br => decode_async(BrBuf::new(input), max_out).await,
+        Coding::Zstd => decode_async(ZstBuf::new(input), max_out).await,
     }
 }
 
-async fn decode_async<R: AsyncRead + Unpin>(mut decoder: R) -> io::Result<Vec<u8>> {
+async fn decode_async<R: AsyncRead + Unpin>(decoder: R, max_out: usize) -> io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt;
+    // 读 max_out + 1 字节：读满则超限。
+    let mut limited = decoder.take(max_out as u64 + 1);
     let mut out = Vec::new();
-    decoder.read_to_end(&mut out).await?;
+    limited.read_to_end(&mut out).await?;
+    if out.len() > max_out {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("decoded size exceeds limit {}", max_out),
+        ));
+    }
     Ok(out)
 }
 
@@ -385,9 +401,34 @@ mod tests {
         let payload = b"the quick brown fox jumps over the lazy dog ".repeat(20);
         for coding in [Coding::Gzip, Coding::Deflate, Coding::Br, Coding::Zstd] {
             let compressed = encode_once(coding, &payload).await;
-            let decoded = decode_bytes(coding, &compressed).await.unwrap();
+            let decoded = decode_bytes(coding, &compressed, payload.len())
+                .await
+                .unwrap();
             assert_eq!(decoded, payload, "roundtrip failed for {:?}", coding);
         }
+    }
+
+    #[tokio::test]
+    async fn decode_bytes_exactly_at_limit_passes() {
+        let payload = b"x".repeat(256);
+        let compressed = encode_once(Coding::Gzip, &payload).await;
+        let decoded = decode_bytes(Coding::Gzip, &compressed, 256).await.unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn decode_bytes_one_byte_over_errors() {
+        let payload = b"x".repeat(256);
+        let compressed = encode_once(Coding::Gzip, &payload).await;
+        let err = decode_bytes(Coding::Gzip, &compressed, 255).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn decode_bytes_identity_limit() {
+        let payload = b"x".repeat(10);
+        assert_eq!(decode_bytes(Coding::Identity, &payload, 10).await.unwrap(), payload);
+        assert!(decode_bytes(Coding::Identity, &payload, 9).await.is_err());
     }
 
     async fn encode_once(coding: Coding, input: &[u8]) -> Vec<u8> {

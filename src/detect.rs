@@ -25,13 +25,13 @@ pub fn match_endpoint(method: &Method, path: &str, query: Option<&str>) -> Optio
     if method != Method::POST {
         return None;
     }
-    if path == "/chat/completions" || path.ends_with("/chat/completions") {
+    if path.ends_with("/chat/completions") {
         return Some(EndpointKind::ChatCompletions);
     }
-    if path == "/responses" || path.ends_with("/responses") {
+    if path.ends_with("/responses") {
         return Some(EndpointKind::Responses);
     }
-    if path == "/messages" || path.ends_with("/messages") {
+    if path.ends_with("/messages") {
         return Some(EndpointKind::AnthropicMessages);
     }
     // Gemini：最后一段以 `:streamGenerateContent` 结尾，且 alt=sse。

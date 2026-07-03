@@ -8,6 +8,7 @@ pub mod encoding;
 pub mod error_event;
 pub mod proxy;
 pub mod sse;
+pub mod server;
 
 use std::convert::Infallible;
 
@@ -50,6 +51,12 @@ pub async fn handle(
 
         if let Some(cl) = content_length {
             if cl > cfg.max_probe_body {
+                tracing::info!(
+                    path = %path,
+                    content_length = cl,
+                    max_probe_body = cfg.max_probe_body,
+                    "content-length exceeds max-probe-body; going transparent (no SSE keepalive)"
+                );
                 return Ok(proxy(&cfg, &client, req).await);
             }
         }
@@ -58,7 +65,12 @@ pub async fn handle(
         let limited = Limited::new(body, cfg.max_probe_body);
         let collected = match limited.collect().await {
             Ok(c) => c.to_bytes(),
-            Err(_) => return Ok(response_413()),
+            Err(e) => {
+                if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                    return Ok(response_413());
+                }
+                return Ok(response_400());
+            }
         };
 
         if kind == EndpointKind::GeminiStream {
@@ -67,7 +79,9 @@ pub async fn handle(
 
         let content_encoding = parse_content_encoding(&parts.headers);
         let probe_body = match content_encoding {
-            Some(ce) => decode_bytes(ce, &collected).await.unwrap_or_default(),
+            Some(ce) => decode_bytes(ce, &collected, cfg.max_probe_body)
+                .await
+                .unwrap_or_default(),
             None => collected.to_vec(),
         };
 
@@ -92,6 +106,26 @@ fn response_413() -> Response<RespBody> {
     let bytes = serde_json::to_vec(&body).expect("json serializable");
     Response::builder()
         .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header("content-type", "application/json")
+        .body(
+            Full::new(Bytes::from(bytes))
+                .map_err(|e: Infallible| match e {})
+                .boxed(),
+        )
+        .expect("response buildable")
+}
+
+/// 400 Bad Request JSON 响应（请求体读取失败）。
+fn response_400() -> Response<RespBody> {
+    let body = serde_json::json!({
+        "error": {
+            "message": "failed to read request body",
+            "type": "invalid_request_error"
+        }
+    });
+    let bytes = serde_json::to_vec(&body).expect("json serializable");
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
         .header("content-type", "application/json")
         .body(
             Full::new(Bytes::from(bytes))

@@ -22,8 +22,73 @@ use crate::encoding::{self, Coding, SseWriter};
 use crate::error_event;
 use crate::proxy::{self, BoxError, ReqBody, RespBody};
 
-/// 心跳注释事件字节。
 const HEARTBEAT: &[u8] = b":\n\n";
+
+/// 错误体读取与解压上限（字节）。
+const MAX_ERROR_BODY: usize = 1024 * 1024;
+
+/// SSE 事件边界跟踪器：观察下行 SSE 字节流，判断是否处于事件边界（流开头或上一事件已以空行终结）。
+struct EventBoundaryTracker {
+    at_boundary: bool,
+    line_empty: bool,
+    prev_cr: bool,
+}
+
+impl EventBoundaryTracker {
+    fn new() -> Self {
+        Self {
+            at_boundary: true,
+            line_empty: true,
+            prev_cr: false,
+        }
+    }
+
+    /// 观察一段写入的字节，更新边界状态。`\r`、`\n`、`\r\n` 均为行终结符，后者只算一次。
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            match b {
+                b'\n' => {
+                    if self.prev_cr {
+                        // \r\n 的第二字节，终结已在 \r 处理过
+                        self.prev_cr = false;
+                    } else if self.line_empty {
+                        self.at_boundary = true;
+                    } else {
+                        self.at_boundary = false;
+                        self.line_empty = true;
+                    }
+                }
+                b'\r' => {
+                    if self.line_empty {
+                        self.at_boundary = true;
+                    } else {
+                        self.at_boundary = false;
+                        self.line_empty = true;
+                    }
+                    self.prev_cr = true;
+                }
+                _ => {
+                    self.prev_cr = false;
+                    self.at_boundary = false;
+                    self.line_empty = false;
+                }
+            }
+        }
+    }
+}
+
+/// 构建下行 SSE 帧通道：返回 (sender, response body)。
+fn sse_channel() -> (
+    mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    RespBody,
+) {
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = StreamBody::new(stream)
+        .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
+        .boxed();
+    (tx, body)
+}
 
 /// SSE 包装通路入口。
 ///
@@ -74,11 +139,7 @@ pub async fn handle_stream(
         }
         _ = tokio::time::sleep(interval) => {
             // 窗口超时：网关自行发 200 SSE，后台继续桥接上游。
-            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
-            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-            let resp_body = StreamBody::new(stream)
-                .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
-                .boxed();
+            let (tx, resp_body) = sse_channel();
 
             let mut resp = Response::new(resp_body);
             *resp.status_mut() = StatusCode::OK;
@@ -210,12 +271,7 @@ async fn passthrough_sse_response(
         .headers
         .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
 
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let resp_body = StreamBody::new(stream)
-        .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
-        .boxed();
-
+    let (tx, resp_body) = sse_channel();
     let resp = Response::from_parts(parts, resp_body);
 
     tokio::task::spawn(async move {
@@ -245,8 +301,12 @@ async fn handle_success(
     upstream_ce: Option<Coding>,
     body: Incoming,
 ) {
+    let mut tracker = EventBoundaryTracker::new();
     let Some(ce) = upstream_ce else {
         // 不可解码的 Content-Encoding → 错误事件。
+        if !tracker.at_boundary {
+            let _ = writer.write_event(Bytes::from_static(b"\n\n")).await;
+        }
         let ev = error_event::build(
             kind,
             None,
@@ -263,7 +323,11 @@ async fn handle_success(
     loop {
         tokio::select! {
             _ = &mut *heartbeat => {
-                if writer.write_event(Bytes::from_static(HEARTBEAT)).await.is_err() {
+                if tracker.at_boundary
+                    && writer.write_event(Bytes::from_static(HEARTBEAT))
+                        .await
+                        .is_err()
+                {
                     return;
                 }
                 *heartbeat = Box::pin(tokio::time::sleep(interval));
@@ -271,6 +335,7 @@ async fn handle_success(
             chunk = stream.next() => {
                 match chunk {
                     Some(Ok(bytes)) => {
+                        tracker.feed(&bytes);
                         if writer.write_event(bytes).await.is_err() {
                             return;
                         }
@@ -278,6 +343,9 @@ async fn handle_success(
                     }
                     Some(Err(e)) => {
                         tracing::warn!(error = %e, "upstream stream error (sse)");
+                        if !tracker.at_boundary {
+                            let _ = writer.write_event(Bytes::from_static(b"\n\n")).await;
+                        }
                         let ev = error_event::build(kind, None, None, Some(&e.to_string()));
                         let _ = writer.write_event(ev).await;
                         return;
@@ -302,8 +370,8 @@ async fn handle_error(
     upstream_ce: Option<Coding>,
     body: Incoming,
 ) {
-    // 读取错误体（上限 1 MiB）。
-    let collect_fut = Limited::new(body, 1024 * 1024).collect();
+    // 读取错误体（上限 MAX_ERROR_BODY）。
+    let collect_fut = Limited::new(body, MAX_ERROR_BODY).collect();
     tokio::pin!(collect_fut);
     let collected = loop {
         tokio::select! {
@@ -325,7 +393,7 @@ async fn handle_error(
     // 解压错误体（如需）。
     let error_body: Vec<u8> = match upstream_ce {
         Some(Coding::Identity) | None => collected.to_vec(),
-        Some(ce) => encoding::decode_bytes(ce, &collected)
+        Some(ce) => encoding::decode_bytes(ce, &collected, MAX_ERROR_BODY)
             .await
             .unwrap_or_else(|_| collected.to_vec()),
     };
@@ -346,4 +414,66 @@ fn build_upstream_request(cfg: &ResolvedConfig, mut parts: Parts, body: Bytes) -
 
     let boxed = Full::new(body).map_err(|e: Infallible| match e {}).boxed();
     Request::from_parts(parts, boxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_lf_lf() {
+        let mut t = EventBoundaryTracker::new();
+        assert!(t.at_boundary);
+        t.feed(b"data: hi\n\n");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_crlf_crlf() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: hi\r\n\r\n");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_mixed_terminators() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: a\n\r\n");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_mid_event_not_at_boundary() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: hi");
+        assert!(!t.at_boundary);
+        t.feed(b"\n");
+        assert!(!t.at_boundary); // one \n ends the data: line, but not an event boundary
+        t.feed(b"\n");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_split_across_feeds() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: hi\n");
+        assert!(!t.at_boundary);
+        t.feed(b"\n");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_cr_only_terminator() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: hi\r\r");
+        assert!(t.at_boundary);
+    }
+
+    #[test]
+    fn boundary_cr_then_non_newline() {
+        let mut t = EventBoundaryTracker::new();
+        t.feed(b"data: hi\r");
+        t.feed(b"data: bye\r\r");
+        assert!(t.at_boundary);
+    }
 }

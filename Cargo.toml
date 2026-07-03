@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "server-auto", "client-legacy", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful", "client-legacy", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -22,7 +22,8 @@ http = "1"
 
 [dev-dependencies]
 flate2 = "1"
-zstd = "0.13"
+parking_lot = "0.12"
+
 
 [profile.release]
 lto = "thin"

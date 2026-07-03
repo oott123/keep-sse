@@ -27,6 +27,10 @@ pub struct Config {
     /// 流式探测的请求体缓冲上限（字节），超限走透明代理。
     #[arg(long, env = "KEEP_SSE_MAX_PROBE_BODY", default_value_t = 32 * 1024 * 1024)]
     pub max_probe_body: usize,
+
+    /// 收到 SIGTERM/SIGINT 后等待存量连接完成的时长（秒），超时强制退出。
+    #[arg(long, env = "KEEP_SSE_SHUTDOWN_TIMEOUT", default_value_t = 30)]
+    pub shutdown_timeout: u64,
 }
 
 /// 校验后的运行时配置。`upstream` 已解析为 `Uri`。
@@ -38,6 +42,7 @@ pub struct ResolvedConfig {
     pub heartbeat_interval: std::time::Duration,
     pub connect_timeout: std::time::Duration,
     pub max_probe_body: usize,
+    pub shutdown_timeout: std::time::Duration,
 }
 
 impl ResolvedConfig {
@@ -75,6 +80,7 @@ impl ResolvedConfig {
             heartbeat_interval: std::time::Duration::from_secs(cfg.heartbeat_interval),
             connect_timeout: std::time::Duration::from_secs(cfg.connect_timeout),
             max_probe_body: cfg.max_probe_body,
+            shutdown_timeout: std::time::Duration::from_secs(cfg.shutdown_timeout),
         })
     }
 }

@@ -44,11 +44,12 @@ fn message(body: Option<&[u8]>, reason: Option<&str>, status: StatusCode) -> Str
             if trimmed.len() <= MAX_MSG {
                 return trimmed.to_string();
             }
+            // 截断 trimmed 至 MAX_MSG，回退到 UTF-8 字符边界。
             let mut end = MAX_MSG;
-            while end > 0 && std::str::from_utf8(&b[..end]).is_err() {
+            while end > 0 && !trimmed.is_char_boundary(end) {
                 end -= 1;
             }
-            String::from_utf8_lossy(&b[..end]).to_string()
+            trimmed[..end].to_string()
         }
         _ => status_fallback(status),
     }
@@ -94,8 +95,8 @@ fn parse_anthropic_error(body: &[u8]) -> Option<serde_json::Value> {
 fn build_chat(status: StatusCode, body: Option<&[u8]>, reason: Option<&str>) -> Bytes {
     let mut s = String::from("data: ");
     if let Some(b) = body.filter(|b| !b.is_empty()) {
-        if parse_top_level_error(b).is_some() {
-            s.push_str(std::str::from_utf8(b).expect("upstream body utf8"));
+        if let Some(value) = parse_top_level_error(b) {
+            s.push_str(&serde_json::to_string(&value).expect("json serializable"));
             s.push_str("\n\ndata: [DONE]\n\n");
             return Bytes::from(s);
         }
@@ -173,8 +174,8 @@ fn responses_code(status: StatusCode) -> &'static str {
 fn build_anthropic(status: StatusCode, body: Option<&[u8]>, reason: Option<&str>) -> Bytes {
     let mut s = String::from("event: error\ndata: ");
     if let Some(b) = body.filter(|b| !b.is_empty()) {
-        if parse_anthropic_error(b).is_some() {
-            s.push_str(std::str::from_utf8(b).expect("upstream body utf8"));
+        if let Some(value) = parse_anthropic_error(b) {
+            s.push_str(&serde_json::to_string(&value).expect("json serializable"));
             s.push_str("\n\n");
             return Bytes::from(s);
         }
@@ -211,8 +212,8 @@ fn anthropic_error_type(status: StatusCode) -> &'static str {
 fn build_gemini(status: StatusCode, body: Option<&[u8]>, reason: Option<&str>) -> Bytes {
     let mut s = String::from("data: ");
     if let Some(b) = body.filter(|b| !b.is_empty()) {
-        if parse_top_level_error(b).is_some() {
-            s.push_str(std::str::from_utf8(b).expect("upstream body utf8"));
+        if let Some(value) = parse_top_level_error(b) {
+            s.push_str(&serde_json::to_string(&value).expect("json serializable"));
             s.push_str("\n\n");
             return Bytes::from(s);
         }
@@ -258,7 +259,7 @@ mod tests {
     fn chat_standard_error_body_passes_through() {
         let body = br#"{"error":{"message":"rate limited","type":"rate_limit_error","param":null,"code":null}}"#;
         let out = build(EndpointKind::ChatCompletions, s(429), Some(body), None);
-        let expected = "data: {\"error\":{\"message\":\"rate limited\",\"type\":\"rate_limit_error\",\"param\":null,\"code\":null}}\n\ndata: [DONE]\n\n";
+        let expected = "data: {\"error\":{\"code\":null,\"message\":\"rate limited\",\"param\":null,\"type\":\"rate_limit_error\"}}\n\ndata: [DONE]\n\n";
         assert_eq!(out.as_ref(), expected.as_bytes());
     }
 
@@ -319,7 +320,7 @@ mod tests {
     fn anthropic_standard_error_body_passes_through() {
         let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#;
         let out = build(EndpointKind::AnthropicMessages, s(429), Some(body), None);
-        let expected = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}\n\n";
+        let expected = "event: error\ndata: {\"error\":{\"message\":\"slow down\",\"type\":\"rate_limit_error\"},\"type\":\"error\"}\n\n";
         assert_eq!(out.as_ref(), expected.as_bytes());
     }
 
@@ -380,5 +381,35 @@ mod tests {
         assert!(s.contains("\"status\":\"UNKNOWN\""));
         assert!(s.contains("\"code\":502"));
         assert!(s.contains("upstream request failed: refused"));
+    }
+
+    #[test]
+    fn chat_pretty_printed_reserialized_single_line() {
+        let body = br#"{
+  "error": { "message": "rate limited", "type": "rate_limit_error" }
+}"#;
+        let out = build(EndpointKind::ChatCompletions, s(429), Some(body), None);
+        let s = std::str::from_utf8(&out).unwrap();
+        // data: 行内无裸换行
+        let data_line = s.lines().next().unwrap();
+        assert!(data_line.starts_with("data: {"));
+        assert!(!data_line.contains('\n'));
+        assert!(s.contains("\"message\":\"rate limited\""));
+        assert!(s.contains("\"type\":\"rate_limit_error\""));
+        assert!(s.ends_with("\n\ndata: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn message_truncation_lands_on_char_boundary() {
+        // "é" is 2 bytes in UTF-8; MAX_MSG=4096 would split a multibyte char.
+        // Build a body long enough to trigger truncation with a multibyte char near the cut.
+        let prefix = "a".repeat(MAX_MSG - 1);
+        let body = format!("{prefix}éé");
+        let out = message(Some(body.as_bytes()), None, StatusCode::BAD_GATEWAY);
+        // Must be valid UTF-8 and not exceed MAX_MSG
+        assert!(out.len() <= MAX_MSG);
+        // The é (2 bytes) at position MAX_MSG-1 would overflow; cut backs off to MAX_MSG-1 ("a")
+        assert_eq!(out.len(), MAX_MSG - 1);
+        assert!(out.is_char_boundary(out.len()));
     }
 }

@@ -16,7 +16,7 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 use keep_sse::config::ResolvedConfig;
-use keep_sse::{create_client, handle};
+use keep_sse::create_client;
 
 /// 启动 mock 上游（Full body 响应），返回 (addr, shutdown)。
 async fn start_mock<F>(handler: F) -> (SocketAddr, oneshot::Sender<()>)
@@ -123,42 +123,40 @@ where
     (addr, tx)
 }
 
-/// 启动网关。
+/// 启动网关（默认配置）。
 async fn start_gateway(upstream: SocketAddr, heartbeat: u64) -> (SocketAddr, oneshot::Sender<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    start_gateway_with(test_cfg(upstream, heartbeat, 32 * 1024 * 1024)).await
+}
+
+/// 构造测试用 ResolvedConfig。
+fn test_cfg(upstream: SocketAddr, heartbeat: u64, max_probe_body: usize) -> ResolvedConfig {
     let upstream_str = format!("http://{}", upstream);
-    let cfg = ResolvedConfig {
-        listen: addr,
+    ResolvedConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
         upstream: upstream_str.parse().unwrap(),
         upstream_authority: upstream.to_string(),
         heartbeat_interval: Duration::from_secs(heartbeat),
         connect_timeout: Duration::from_secs(5),
-        max_probe_body: 32 * 1024 * 1024,
+        max_probe_body,
+        shutdown_timeout: Duration::from_secs(30),
+    }
+}
+
+/// 启动网关（自定义配置），使用 server::run 驱动，返回 shutdown 触发端。
+async fn start_gateway_with(cfg: ResolvedConfig) -> (SocketAddr, oneshot::Sender<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = ResolvedConfig {
+        listen: addr,
+        ..cfg
     };
     let client = create_client(&cfg);
-    let (tx, mut rx) = oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel::<()>();
     tokio::task::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut rx => break,
-                accept = listener.accept() => {
-                    let (stream, _) = match accept { Ok(v) => v, Err(_) => continue };
-                    let io = TokioIo::new(stream);
-                    let cfg = cfg.clone();
-                    let client = client.clone();
-                    tokio::task::spawn(async move {
-                        let _ = http1::Builder::new()
-                            .serve_connection(io, service_fn(move |req| {
-                                let cfg = cfg.clone();
-                                let client = client.clone();
-                                async move { handle(cfg, client, req).await }
-                            }))
-                            .await;
-                    });
-                }
-            }
-        }
+        keep_sse::server::run(cfg, client, listener, async move {
+            let _ = rx.await;
+        })
+        .await;
     });
     sleep(Duration::from_millis(50)).await;
     (addr, tx)
@@ -542,10 +540,10 @@ async fn test_gzip_stream_request_body() {
     gz.write_all(payload.as_bytes()).unwrap();
     let compressed = gz.finish().unwrap();
 
-    let received_body = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_body = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
     let rb = received_body.clone();
     let (upstream, tx) = start_mock_raw(move |body, _path| {
-        *rb.lock().unwrap() = body.to_vec();
+        *rb.lock() = body.to_vec();
         (
             200,
             vec![("content-type", "text/event-stream".to_string())],
@@ -567,7 +565,7 @@ async fn test_gzip_stream_request_body() {
     assert_eq!(status, 200);
 
     // Verify upstream received the original compressed bytes
-    let rb = received_body.lock().unwrap();
+    let rb = received_body.lock();
     assert_eq!(
         &rb[..],
         &compressed[..],
@@ -783,4 +781,295 @@ async fn test_fast_json_response_pure_passthrough() {
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
+}
+
+/// 解析 chunked transfer-encoding body，返回解码后的字节。
+fn dechunk(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        let line_end = input[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| pos + i)
+            .unwrap_or(input.len());
+        let size_str = std::str::from_utf8(&input[pos..line_end])
+            .unwrap()
+            .trim();
+        let size = usize::from_str_radix(size_str, 16).unwrap();
+        pos = line_end + 1;
+        if size == 0 {
+            break;
+        }
+        out.extend_from_slice(&input[pos..pos + size]);
+        pos += size + 2; // skip \r\n
+    }
+    out
+}
+
+#[tokio::test]
+async fn test_sse_downstream_gzip() {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    // 慢数据上游：延迟 2.5s（触发心跳），再发数据
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            2500,
+            vec![
+                (b"data: hello\n\n".to_vec(), 0),
+                (b"data: world\n\n".to_vec(), 0),
+            ],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-encoding")
+            .map(|(_, v)| v.as_str()),
+        Some("gzip")
+    );
+
+    let decoded = dechunk(&resp_body);
+    let mut gz = GzDecoder::new(&decoded[..]);
+    let mut decompressed = String::new();
+    gz.read_to_string(&mut decompressed).unwrap();
+    // 心跳与数据事件都在
+    assert!(decompressed.contains("hello"));
+    assert!(decompressed.contains("world"));
+    let heartbeats = decompressed.matches(":\n\n").count();
+    assert!(
+        heartbeats >= 1,
+        "expected >= 1 heartbeat, got {} in {:?}",
+        heartbeats, decompressed
+    );
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_undecodable_encoding_passthrough() {
+    // 窗口内 2xx SSE + Content-Encoding: snappy → 完整透传
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![
+                ("content-type", "text/event-stream".to_string()),
+                ("content-encoding", "snappy".to_string()),
+            ],
+            0,
+            vec![(b"data: hi\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 60).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    // snappy 不可解码 → 透传上游 content-encoding
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-encoding")
+            .map(|(_, v)| v.as_str()),
+        Some("snappy")
+    );
+    let body = dechunk(&resp_body);
+    assert_eq!(&body[..], b"data: hi\n\n");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_probe_decompress_bomb_goes_transparent() {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    // 压缩后 < 1 KiB、解压后 > 1 KiB 的 gzip 体
+    let payload = "x".repeat(2048);
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(payload.as_bytes()).unwrap();
+    let compressed = gz.finish().unwrap();
+    assert!(compressed.len() < 1024);
+
+    let received_body = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let rb = received_body.clone();
+    let (upstream, tx) = start_mock_raw(move |body, _path| {
+        *rb.lock() = body.to_vec();
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![(b"data: ok\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway_with(test_cfg(upstream, 60, 1024)).await;
+
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nContent-Type: application/json\r\n\r\n",
+        compressed.len()
+    );
+    let mut req = req.into_bytes();
+    req.extend_from_slice(&compressed);
+    let resp = send_raw_bytes(gw, &req).await;
+    let (status, _, _) = parse_response(&resp);
+    assert_eq!(status, 200);
+
+    // 上游应收到原始压缩字节（透明代理）
+    let rb = received_body.lock();
+    assert_eq!(&rb[..], &compressed[..], "upstream should receive original compressed bytes");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_error_event_reserialized_single_line() {
+    // 慢上游 429 + pretty-printed 错误 JSON → SSE 错误事件 data: 行内无裸换行
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        let body = br#"{
+  "error": { "message": "rate limited", "type": "rate_limit_error" }
+}"#;
+        (
+            429,
+            vec![("content-type", "application/json".to_string())],
+            1500,
+            vec![(body.to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, _, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200); // 窗口超时，网关发 200 SSE
+    let s = String::from_utf8_lossy(&resp_body);
+    assert!(s.contains("data: {\"error\":"));
+    assert!(s.contains("\"message\":\"rate limited\""));
+    // data: 行内无裸换行（紧凑重序列化）
+    for line in s.lines() {
+        if line.starts_with("data: ") {
+            assert!(!line.contains('\n'), "data: line should not contain newlines: {line}");
+        }
+    }
+    assert!(s.contains("[DONE]"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_heartbeat_not_injected_mid_event() {
+    // 心跳间隔 1s，上游把一个事件拆两 chunk、中间停 2.5s
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![
+                (b"data: {\"choices\":[{\"delta\":{\"content\":\"hel".to_vec(), 0),
+                (b"lo\"}}]}\n\n".to_vec(), 2500),
+            ],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, _, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    let body = dechunk(&resp_body);
+    let s = String::from_utf8_lossy(&body);
+    // 事件字节连续完整：hel 后面紧接 lo\"}}]}\n\n，中间无心跳
+    let event_start = s.find("data: {\"choices\":").unwrap();
+    let event_fragment = &s[event_start..];
+    // 心跳 ":\n\n 不应出现在事件中间
+    let mid_event_section = &event_fragment[..event_fragment.find("\n\n").unwrap_or(event_fragment.len())];
+    assert!(
+        !mid_event_section.contains(":\n\n"),
+        "heartbeat should not appear mid-event: {mid_event_section:?}"
+    );
+    // 事件完整
+    assert!(s.contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_graceful_shutdown_drains_stream() {
+    // 进行中的慢 SSE 请求 + 触发 shutdown → 该流完整收完
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![
+                (b"data: first\n\n".to_vec(), 500),
+                (b"data: second\n\n".to_vec(), 500),
+            ],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 60).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    // 不用 Connection: close，让流自然结束
+    let mut stream = tokio::net::TcpStream::connect(gw).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // 等待第一个数据到达
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    // 触发 shutdown
+    gw_tx.send(()).unwrap();
+
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let s = String::from_utf8_lossy(&resp);
+    assert!(s.contains("first"), "should contain first event: {s}");
+    assert!(s.contains("second"), "should contain second event after shutdown: {s}");
+
+    // shutdown 后新连接无法建立
+    let new_conn = tokio::net::TcpStream::connect(gw).await;
+    assert!(new_conn.is_err(), "new connection after shutdown should fail");
+
+    tx.send(()).unwrap();
 }

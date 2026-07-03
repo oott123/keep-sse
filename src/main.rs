@@ -1,9 +1,6 @@
 use std::process::ExitCode;
 
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
-use keep_sse::{config, create_client, handle};
+use keep_sse::{config, create_client, server};
 use tokio::net::TcpListener;
 use tracing::info;
 
@@ -32,27 +29,6 @@ async fn main() -> ExitCode {
         }
     };
 
-    loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept failed");
-                continue;
-            }
-        };
-        let io = TokioIo::new(stream);
-        let cfg = cfg.clone();
-        let client = client.clone();
-        tokio::task::spawn(async move {
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(move |req| handle(cfg.clone(), client.clone(), req)),
-                )
-                .await
-            {
-                tracing::debug!(error = %e, %peer, "connection closed");
-            }
-        });
-    }
+    server::run(cfg, client, listener, server::shutdown_signal()).await;
+    ExitCode::SUCCESS
 }
