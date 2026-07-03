@@ -1,0 +1,23 @@
+# build artifacts
+target/
+debug/
+
+# local dev
+.data/
+.local/
+
+# editor / vcs
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# docs / specs / plans not needed at build time
+specs/
+plans/
+README.md
+Dockerfile
+.dockerignore
+mise.toml
+**/*.rs.bk
+*.pdb
