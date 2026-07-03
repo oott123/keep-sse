@@ -1,4 +1,4 @@
-//! SSE 包装通路：先行 200 SSE、心跳计时、上游桥接。
+//! SSE 包装通路：延迟 200 响应、心跳计时、上游桥接。
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -7,12 +7,12 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
-    HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, HOST,
+    HeaderMap, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, HOST,
 };
 use hyper::http::request::Parts;
 use hyper::{Request, Response, StatusCode};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::{connect::HttpConnector, Client, ResponseFuture};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt as _;
 
@@ -27,7 +27,7 @@ const HEARTBEAT: &[u8] = b":\n\n";
 
 /// SSE 包装通路入口。
 ///
-/// 返回立即构造的 200 SSE 响应；后台任务桥接上游数据、心跳与错误事件。
+/// 与上游响应赛跑一个心跳间隔：窗口内上游返回则透传/桥接，超时则自行发 200 SSE。
 pub async fn handle_stream(
     cfg: ResolvedConfig,
     client: Client<HttpConnector, ReqBody>,
@@ -42,62 +42,81 @@ pub async fn handle_stream(
         .and_then(|v| v.to_str().ok());
     let down_coding = encoding::negotiate(accept);
 
-    // 构建 mpsc → StreamBody 作为响应 body。
-    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let resp_body = StreamBody::new(stream)
-        .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
-        .boxed();
-
-    let mut resp = Response::new(resp_body);
-    *resp.status_mut() = StatusCode::OK;
-    let headers = resp.headers_mut();
-    headers.insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/event-stream; charset=utf-8"),
-    );
-    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-    headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-    if let Some(val) = down_coding.header_value() {
-        headers.insert(CONTENT_ENCODING, HeaderValue::from_static(val));
-    }
-
-    // 后台桥接任务。
     let interval = cfg.heartbeat_interval;
-    tokio::task::spawn(bridge(
-        cfg,
-        client,
-        parts,
-        body,
-        kind,
-        down_coding,
-        interval,
-        tx,
-    ));
 
-    resp
+    // 构建上游请求并发起，与心跳间隔赛跑。
+    let upstream_req = build_upstream_request(&cfg, parts, body);
+    let mut upstream_fut = client.request(upstream_req);
+
+    tokio::select! {
+        result = &mut upstream_fut => {
+            match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let headers = resp.headers();
+                    let upstream_ce = encoding::parse_content_encoding(headers);
+                    let is_sse = is_event_stream(headers);
+                    if status.is_success() && is_sse {
+                        if let Some(ce) = upstream_ce {
+                            passthrough_sse_response(resp, kind, down_coding, ce, interval).await
+                        } else {
+                            proxy::passthrough_response(resp)
+                        }
+                    } else {
+                        proxy::passthrough_response(resp)
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "upstream request failed (sse)");
+                    proxy::bad_gateway(&e.to_string())
+                }
+            }
+        }
+        _ = tokio::time::sleep(interval) => {
+            // 窗口超时：网关自行发 200 SSE，后台继续桥接上游。
+            let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
+            let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+            let resp_body = StreamBody::new(stream)
+                .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
+                .boxed();
+
+            let mut resp = Response::new(resp_body);
+            *resp.status_mut() = StatusCode::OK;
+            let resp_headers = resp.headers_mut();
+            resp_headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream; charset=utf-8"),
+            );
+            resp_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            resp_headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+            if let Some(val) = down_coding.header_value() {
+                resp_headers.insert(CONTENT_ENCODING, HeaderValue::from_static(val));
+            }
+
+            tokio::task::spawn(bridge(
+                kind,
+                down_coding,
+                interval,
+                tx,
+                upstream_fut,
+            ));
+
+            resp
+        }
+    }
 }
 
-/// 后台桥接：上游请求 → 解压 → SseWriter；心跳计时；错误事件。
-#[allow(clippy::too_many_arguments)]
+/// 后台桥接：等待上游响应 → 解压 → SseWriter；心跳计时；错误事件。
 async fn bridge(
-    cfg: ResolvedConfig,
-    client: Client<HttpConnector, ReqBody>,
-    parts: Parts,
-    body: Bytes,
     kind: EndpointKind,
     down_coding: Coding,
     interval: Duration,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
+    upstream_fut: ResponseFuture,
 ) {
     let mut writer = SseWriter::new(down_coding, tx);
     let mut heartbeat = Box::pin(tokio::time::sleep(interval));
-
-    // 构建上游请求。
-    let upstream_req = build_upstream_request(&cfg, parts, body);
-
-    let upstream_fut = client.request(upstream_req);
-    let mut upstream_fut = Box::pin(upstream_fut);
+    let mut upstream_fut = upstream_fut;
 
     // 阶段 1：等待上游响应，同时保活。
     let upstream_resp = loop {
@@ -151,6 +170,70 @@ async fn bridge(
     }
 
     writer.end().await;
+}
+
+/// 判断响应 `Content-Type` 是否为 `text/event-stream`（取 `;` 前媒体类型，不区分大小写）。
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
+        .unwrap_or(false)
+}
+
+/// 头透传 + 桥接 body：透传上游状态码与响应头（去掉 hop-by-hop、Content-Length，
+/// 替换 Content-Encoding 为下行编码），body 走现有解压 → SseWriter → 重编码通路。
+async fn passthrough_sse_response(
+    resp: Response<Incoming>,
+    kind: EndpointKind,
+    down_coding: Coding,
+    upstream_ce: Coding,
+    interval: Duration,
+) -> Response<RespBody> {
+    let (mut parts, body) = resp.into_parts();
+
+    proxy::strip_hop_by_hop(&mut parts.headers);
+    parts.headers.remove(CONTENT_LENGTH);
+    parts.headers.remove(CONTENT_ENCODING);
+    if let Some(val) = down_coding.header_value() {
+        parts
+            .headers
+            .insert(CONTENT_ENCODING, HeaderValue::from_static(val));
+    }
+    parts
+        .headers
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let resp_body = StreamBody::new(stream)
+        .map_err(|e: std::io::Error| -> BoxError { Box::new(e) })
+        .boxed();
+
+    let resp = Response::from_parts(parts, resp_body);
+
+    tokio::task::spawn(async move {
+        let mut writer = SseWriter::new(down_coding, tx);
+        let mut heartbeat = Box::pin(tokio::time::sleep(interval));
+        handle_success(
+            &mut writer,
+            &mut heartbeat,
+            interval,
+            kind,
+            Some(upstream_ce),
+            body,
+        )
+        .await;
+        writer.end().await;
+    });
+
+    resp
 }
 
 /// 处理 2xx 上游响应：流式解压并写入客户端。

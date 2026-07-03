@@ -137,16 +137,19 @@ pub async fn proxy_req(
     *req.uri_mut() = upstream_uri;
 
     match client.request(req).await {
-        Ok(upstream_resp) => {
-            let (mut parts, body) = upstream_resp.into_parts();
-            strip_hop_by_hop(&mut parts.headers);
-            Response::from_parts(parts, body.map_err(box_err_generic).boxed())
-        }
+        Ok(upstream_resp) => passthrough_response(upstream_resp),
         Err(e) => {
             tracing::warn!(error = %e, "upstream request failed (transparent)");
             bad_gateway(&e.to_string())
         }
     }
+}
+
+/// 透传上游响应：strip hop-by-hop、body 直通装箱。
+pub fn passthrough_response(upstream_resp: Response<Incoming>) -> Response<RespBody> {
+    let (mut parts, body) = upstream_resp.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    Response::from_parts(parts, body.map_err(box_err_generic).boxed())
 }
 
 /// 把任意 body 错误统一转为 `BoxError`。

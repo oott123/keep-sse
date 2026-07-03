@@ -83,6 +83,6 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 ## 已知取舍
 
-- SSE 包装通路下网关先于上游发出 200 响应头，上游的响应头（`x-request-id`、限流头等）无法透传给客户端
+- SSE 包装通路下网关等待一个心跳间隔与上游响应赛跑：窗口内上游返回 2xx SSE 流式响应则透传上游状态码与响应头（含 `x-request-id`、限流头等）并桥接 body；窗口超时则网关先行发出 200，此后上游的响应头无法透传给客户端
 - 无 `Content-Length` 且缓冲超过 `--max-probe-body` 的候选请求返回 413
 - `Content-Length` 超过 `--max-probe-body` 的候选请求直接走透明代理（不探测 `stream` 字段）

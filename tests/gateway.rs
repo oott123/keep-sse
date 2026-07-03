@@ -51,10 +51,11 @@ where
 }
 
 /// 启动可流式发送数据的 mock 上游（原始 TCP）。
-/// handler 返回 (status, headers, Vec<(data, delay_ms)>) — 每块发送后 sleep delay_ms。
+/// handler 返回 (status, headers, header_delay_ms, Vec<(data, delay_ms)>) —
+/// header_delay_ms 为发送响应头前的延迟；每块发送后 sleep delay_ms。
 async fn start_mock_raw<F>(handler: F) -> (SocketAddr, oneshot::Sender<()>)
 where
-    F: Fn(&[u8], &str) -> (u16, Vec<(&'static str, String)>, Vec<(Vec<u8>, u64)>)
+    F: Fn(&[u8], &str) -> (u16, Vec<(&'static str, String)>, u64, Vec<(Vec<u8>, u64)>)
         + Send
         + Sync
         + 'static,
@@ -93,7 +94,10 @@ where
                             if n == 0 { break; }
                             body.extend_from_slice(&buf[..n]);
                         }
-                        let (status, headers, chunks) = h(&body, path);
+                        let (status, headers, header_delay_ms, chunks) = h(&body, path);
+                        if header_delay_ms > 0 {
+                            sleep(Duration::from_millis(header_delay_ms)).await;
+                        }
                         let mut resp = format!("HTTP/1.1 {}\r\n", status);
                         for (k, v) in &headers {
                             resp.push_str(&format!("{}: {}\r\n", k, v));
@@ -314,6 +318,7 @@ async fn test_stream_true_chat_completions() {
         (
             200,
             vec![("content-type", "text/event-stream".to_string())],
+            0,
             vec![
                 (
                     b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
@@ -334,12 +339,13 @@ async fn test_stream_true_chat_completions() {
     let resp = send_raw(gw, &req).await;
     let (status, headers, resp_body) = parse_response(&resp);
     assert_eq!(status, 200);
+    // Fast SSE passthrough: content-type is upstream's original value
     assert_eq!(
         headers
             .iter()
             .find(|(k, _)| k == "content-type")
             .map(|(_, v)| v.as_str()),
-        Some("text/event-stream; charset=utf-8")
+        Some("text/event-stream")
     );
     let body_str = String::from_utf8_lossy(&resp_body);
     assert!(body_str.contains("data: {\"choices\""));
@@ -369,6 +375,7 @@ async fn test_stream_true_all_four_endpoints() {
             (
                 200,
                 vec![("content-type", "text/event-stream".to_string())],
+                0,
                 vec![(
                     b"data: {\"type\":\"message\",\"choices\":[],\"candidates\":[]}\n\n".to_vec(),
                     0,
@@ -389,12 +396,7 @@ async fn test_stream_true_all_four_endpoints() {
             .iter()
             .find(|(k, _)| k == "content-type")
             .map(|(_, v)| v.as_str());
-        assert_eq!(
-            ct,
-            Some("text/event-stream; charset=utf-8"),
-            "path {} content-type",
-            path
-        );
+        assert_eq!(ct, Some("text/event-stream"), "path {} content-type", path);
         let body_str = String::from_utf8_lossy(&resp_body);
         assert!(
             body_str.contains("data: "),
@@ -413,6 +415,7 @@ async fn test_heartbeat_during_delay() {
         (
             200,
             vec![("content-type", "text/event-stream".to_string())],
+            0,
             vec![
                 (b"data: hello\n\n".to_vec(), 2500), // 2.5s delay before first data
             ],
@@ -448,15 +451,16 @@ async fn test_heartbeat_during_delay() {
 }
 
 #[tokio::test]
-async fn test_upstream_429_error_event_chat() {
-    let (upstream, tx) = start_mock_raw(|_b, _p| {
-        let err = r#"{"error":{"message":"rate limited","type":"rate_limit_error","param":null,"code":null}}"#;
-        (
-            429,
-            vec![("content-type", "application/json".to_string())],
-            vec![(err.as_bytes().to_vec(), 0)],
-        )
-    }).await;
+async fn test_fast_429_passthrough() {
+    let err = r#"{"error":{"message":"rate limited","type":"rate_limit_error","param":null,"code":null}}"#;
+    let (upstream, tx) = start_mock(move |_req| {
+        Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(err.as_bytes())))
+            .unwrap()
+    })
+    .await;
     let (gw, gw_tx) = start_gateway(upstream, 60).await;
 
     let body = r#"{"stream":true}"#;
@@ -465,11 +469,19 @@ async fn test_upstream_429_error_event_chat() {
         body.len(), body
     );
     let resp = send_raw(gw, &req).await;
-    let (status, _, resp_body) = parse_response(&resp);
-    assert_eq!(status, 200);
+    let (status, headers, resp_body) = parse_response(&resp);
+    // Fast 429 → complete passthrough (status, headers, body)
+    assert_eq!(status, 429);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str()),
+        Some("application/json")
+    );
+    assert_eq!(&resp_body[..], err.as_bytes());
     let body_str = String::from_utf8_lossy(&resp_body);
-    assert!(body_str.contains("rate limited"));
-    assert!(body_str.contains("[DONE]"));
+    assert!(!body_str.contains("[DONE]"));
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
@@ -493,10 +505,10 @@ async fn test_upstream_connection_failure_sse() {
     );
     let resp = send_raw(gw, &req).await;
     let (status, _, resp_body) = parse_response(&resp);
-    assert_eq!(status, 200); // SSE path returns 200
+    assert_eq!(status, 502); // TCP error → 502 Bad Gateway
     let body_str = String::from_utf8_lossy(&resp_body);
     assert!(body_str.contains("upstream request failed"));
-    assert!(body_str.contains("[DONE]"));
+    assert!(!body_str.contains("[DONE]"));
 
     gw_tx.send(()).unwrap();
 }
@@ -537,6 +549,7 @@ async fn test_gzip_stream_request_body() {
         (
             200,
             vec![("content-type", "text/event-stream".to_string())],
+            0,
             vec![(b"data: hi\n\n".to_vec(), 0)],
         )
     })
@@ -567,14 +580,8 @@ async fn test_gzip_stream_request_body() {
 
 #[tokio::test]
 async fn test_accept_encoding_passthrough() {
-    let received_headers = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let rh = received_headers.clone();
-    let (upstream, tx) = start_mock_raw(move |_body, _path| {
-        // We can't easily capture headers in the raw mock, so let's just return 200
-        *rh.lock().unwrap() = "captured".to_string();
-        (200, vec![], vec![(b"ok".to_vec(), 0)])
-    })
-    .await;
+    let (upstream, tx) =
+        start_mock_raw(|_body, _path| (200, vec![], 0, vec![(b"ok".to_vec(), 0)])).await;
     let (gw, gw_tx) = start_gateway(upstream, 60).await;
 
     // Transparent path with Accept-Encoding
@@ -618,6 +625,161 @@ async fn test_gemini_without_alt_sse_goes_transparent() {
             .map(|(_, v)| v.as_str()),
         Some("application/json")
     );
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_slow_upstream_gateway_200() {
+    // Upstream header delay > heartbeat window → gateway sends its own 200 SSE.
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            1500, // 1.5s header delay > 1s heartbeat window
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await; // 1s heartbeat
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    // Gateway's own content-type (with charset)
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str()),
+        Some("text/event-stream; charset=utf-8")
+    );
+    let body_str = String::from_utf8_lossy(&resp_body);
+    assert!(body_str.contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_slow_upstream_429_error_event() {
+    // Upstream header delay > window and non-2xx → SSE error event via gateway 200.
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            429,
+            vec![("content-type", "application/json".to_string())],
+            1500, // 1.5s header delay > 1s window
+            vec![(b"{\"error\":\"rate limited\"}".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await; // 1s heartbeat
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, _, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200); // Gateway 200 (window timeout)
+    let body_str = String::from_utf8_lossy(&resp_body);
+    assert!(body_str.contains("rate limited"));
+    assert!(body_str.contains("[DONE]"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_fast_sse_passthrough_headers_and_heartbeat() {
+    // Fast 2xx SSE with x-request-id header, data delayed 2.5s → header passthrough + heartbeats.
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![
+                ("content-type", "text/event-stream".to_string()),
+                ("x-request-id", "test-123".to_string()),
+            ],
+            0,
+            vec![(b"data: hello\n\n".to_vec(), 2500)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await; // 1s heartbeat
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    // x-request-id should be passed through
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "x-request-id")
+            .map(|(_, v)| v.as_str()),
+        Some("test-123")
+    );
+    let heartbeats = resp_body.windows(3).filter(|w| w == b":\n\n").count();
+    assert!(
+        heartbeats >= 2,
+        "expected >= 2 heartbeats, got {} in {:?}",
+        heartbeats,
+        String::from_utf8_lossy(&resp_body)
+    );
+    assert!(
+        resp_body.windows(5).any(|w| w == b"hello"),
+        "should contain hello in {:?}",
+        String::from_utf8_lossy(&resp_body)
+    );
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_fast_json_response_pure_passthrough() {
+    // Fast 2xx application/json for stream:true request → pure passthrough (no SSE wrapping).
+    let json_body = br#"{"id":"chatcmpl-1","object":"chat.completion","choices":[]}"#;
+    let (upstream, tx) = start_mock(move |_req| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(json_body)))
+            .unwrap()
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str()),
+        Some("application/json")
+    );
+    // Body is byte-for-byte identical to upstream
+    assert_eq!(&resp_body[..], json_body);
+    // No heartbeat bytes
+    assert!(!resp_body.windows(3).any(|w| w == b":\n\n"));
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
