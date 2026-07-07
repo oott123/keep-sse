@@ -45,32 +45,52 @@ impl EventBoundaryTracker {
 
     /// 观察一段写入的字节，更新边界状态。`\r`、`\n`、`\r\n` 均为行终结符，后者只算一次。
     fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            match b {
-                b'\n' => {
-                    if self.prev_cr {
-                        // \r\n 的第二字节，终结已在 \r 处理过
+        let mut pos = 0;
+        loop {
+            match memchr::memchr2(b'\n', b'\r', &bytes[pos..]) {
+                None => {
+                    // 尾段无换行符：若有字节，更新一次「有内容」
+                    if pos < bytes.len() {
                         self.prev_cr = false;
-                    } else if self.line_empty {
-                        self.at_boundary = true;
-                    } else {
                         self.at_boundary = false;
-                        self.line_empty = true;
+                        self.line_empty = false;
                     }
+                    return;
                 }
-                b'\r' => {
-                    if self.line_empty {
-                        self.at_boundary = true;
-                    } else {
+                Some(i) => {
+                    let start = pos;
+                    let nl = pos + i;
+                    // 换行符前的非空段（若有字节）→ 更新「有内容」
+                    if nl > start {
+                        self.prev_cr = false;
                         self.at_boundary = false;
-                        self.line_empty = true;
+                        self.line_empty = false;
                     }
-                    self.prev_cr = true;
-                }
-                _ => {
-                    self.prev_cr = false;
-                    self.at_boundary = false;
-                    self.line_empty = false;
+                    // 处理换行符（状态机逻辑与逐字节版本一致）
+                    match bytes[nl] {
+                        b'\n' => {
+                            if self.prev_cr {
+                                // \r\n 的第二字节，终结已在 \r 处理过
+                                self.prev_cr = false;
+                            } else if self.line_empty {
+                                self.at_boundary = true;
+                            } else {
+                                self.at_boundary = false;
+                                self.line_empty = true;
+                            }
+                        }
+                        b'\r' => {
+                            if self.line_empty {
+                                self.at_boundary = true;
+                            } else {
+                                self.at_boundary = false;
+                                self.line_empty = true;
+                            }
+                            self.prev_cr = true;
+                        }
+                        _ => unreachable!(),
+                    }
+                    pos = nl + 1;
                 }
             }
         }
