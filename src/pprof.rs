@@ -94,9 +94,13 @@ async fn dump_loop() {
         match fs::File::create(&svg_path) {
             Ok(mut f) => match report.flamegraph(&mut f) {
                 Ok(()) => info!(path = %svg_path.display(), "pprof: wrote flamegraph"),
-                Err(e) => warn!(error = %e, path = %svg_path.display(), "pprof: failed to write flamegraph"),
+                Err(e) => {
+                    warn!(error = %e, path = %svg_path.display(), "pprof: failed to write flamegraph")
+                }
             },
-            Err(e) => warn!(error = %e, path = %svg_path.display(), "pprof: failed to open flamegraph file"),
+            Err(e) => {
+                warn!(error = %e, path = %svg_path.display(), "pprof: failed to open flamegraph file")
+            }
         }
 
         match report.pprof() {
@@ -104,7 +108,9 @@ async fn dump_loop() {
                 let content = pprof::protos::Message::encode_to_vec(&profile);
                 match fs::write(&pb_path, &content) {
                     Ok(()) => info!(path = %pb_path.display(), "pprof: wrote protobuf"),
-                    Err(e) => warn!(error = %e, path = %pb_path.display(), "pprof: failed to write protobuf"),
+                    Err(e) => {
+                        warn!(error = %e, path = %pb_path.display(), "pprof: failed to write protobuf")
+                    }
                 }
             }
             Err(e) => warn!(error = %e, "pprof: failed to build protobuf report"),

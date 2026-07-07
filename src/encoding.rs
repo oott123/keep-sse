@@ -93,8 +93,7 @@ pub fn negotiate(accept_encoding: Option<&str>) -> Coding {
         return Coding::Identity;
     }
 
-    let (mut zstd, mut br, mut gzip, mut deflate, mut identity) =
-        (None, None, None, None, None);
+    let (mut zstd, mut br, mut gzip, mut deflate, mut identity) = (None, None, None, None, None);
     let mut wildcard = None;
     for raw in val.split(',') {
         let tok = raw.trim();

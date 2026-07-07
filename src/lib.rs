@@ -6,11 +6,11 @@ pub mod config;
 pub mod detect;
 pub mod encoding;
 pub mod error_event;
+#[cfg(feature = "pprof")]
+pub mod pprof;
 pub mod proxy;
 pub mod server;
 pub mod sse;
-#[cfg(feature = "pprof")]
-pub mod pprof;
 
 use std::convert::Infallible;
 

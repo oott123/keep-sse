@@ -2,7 +2,7 @@
 
 ## 1. 依赖与 profile
 
-- `Cargo.toml`：新增 `[features] default = []`、`pprof = ["dep:pprof"]`；`pprof = { version = "0.14", optional = true, features = ["flamegraph", "protobuf"] }`。
+- `Cargo.toml`：新增 `[features] default = []`、`pprof = ["dep:pprof"]`；`pprof = { version = "0.14", optional = true, features = ["flamegraph", "prost-codec"] }`。
 - 新增 `[profile.pprof]`：`inherits = "release"`、`debug = true`、`lto = false`。
 
 ## 2. pprof 模块
@@ -12,7 +12,7 @@
   - 常驻任务：`ProfilerGuard::new(99)` 建 guard 并持有 → `signal(SignalKind::user_defined1())` 循环 `recv()` → 每次 dump：
     - `guard.report().build()` 得 `Report`。
     - 写 `KEEP_SSE_PPROF_DIR/keep-sse-<ts>.svg`（`report.flamegraph(&mut file)`）。
-    - 写 `KEEP_SSE_PPROF_DIR/keep-sse-<ts>.pb`（`report.protobuf(&mut file)`）。
+    - 写 `KEEP_SSE_PPROF_DIR/keep-sse-<ts>.pb`（`report.pprof()` 得 `protos::Profile`，`Message::encode_to_vec` 写文件）。
     - 成功 `info!` 打印两路径；失败 `warn!` 打印错误、继续。
   - guard 生命周期随任务存活，进程退出时 drop 自动停采样。
 - `src/lib.rs`：`#[cfg(feature = "pprof")] pub mod pprof;`
