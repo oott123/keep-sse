@@ -78,10 +78,7 @@ impl EventBoundaryTracker {
 }
 
 /// 构建下行 SSE 帧通道：返回 (sender, response body)。
-fn sse_channel() -> (
-    mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
-    RespBody,
-) {
+fn sse_channel() -> (mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>, RespBody) {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
     let body = StreamBody::new(stream)

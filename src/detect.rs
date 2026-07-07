@@ -1,5 +1,6 @@
 //! 端点识别与 `stream` 字段探测。
 
+use hyper::header::{HeaderMap, ACCEPT};
 use hyper::Method;
 
 /// 识别出的 LLM 流式接口类型。
@@ -66,6 +67,18 @@ struct Probe {
 pub fn probe_stream_flag(json_body: &[u8]) -> bool {
     serde_json::from_slice::<Probe>(json_body)
         .map(|p| p.stream)
+        .unwrap_or(false)
+}
+
+/// 判定请求是否带 `Accept: text/event-stream` 头（精确匹配）。
+///
+/// 取 `ACCEPT` 头，`to_str()` 失败返回 `false`；去除前后空白后须严格等于
+/// `text/event-stream`。多值 Accept、带参数的 media type、无头、空值一律不命中。
+pub fn accepts_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim() == "text/event-stream")
         .unwrap_or(false)
 }
 
@@ -171,5 +184,48 @@ mod tests {
         assert!(!probe_stream_flag(br#"not json"#));
         // stream 为非布尔值也应视为非流式
         assert!(!probe_stream_flag(br#"{"stream":"true"}"#));
+    }
+    #[test]
+    fn accepts_event_stream_exact() {
+        let mut h = HeaderMap::new();
+        h.insert(ACCEPT, "text/event-stream".parse().unwrap());
+        assert!(accepts_event_stream(&h));
+    }
+
+    #[test]
+    fn accepts_event_stream_trimmed_whitespace() {
+        let mut h = HeaderMap::new();
+        h.insert(ACCEPT, "  text/event-stream  ".parse().unwrap());
+        assert!(accepts_event_stream(&h));
+    }
+
+    #[test]
+    fn accepts_event_stream_multi_value_not_matched() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            ACCEPT,
+            "text/event-stream, application/json".parse().unwrap(),
+        );
+        assert!(!accepts_event_stream(&h));
+    }
+
+    #[test]
+    fn accepts_event_stream_with_parameter_not_matched() {
+        let mut h = HeaderMap::new();
+        h.insert(ACCEPT, "text/event-stream; charset=utf-8".parse().unwrap());
+        assert!(!accepts_event_stream(&h));
+    }
+
+    #[test]
+    fn accepts_event_stream_missing_header() {
+        let h = HeaderMap::new();
+        assert!(!accepts_event_stream(&h));
+    }
+
+    #[test]
+    fn accepts_event_stream_empty_value() {
+        let mut h = HeaderMap::new();
+        h.insert(ACCEPT, "".parse().unwrap());
+        assert!(!accepts_event_stream(&h));
     }
 }

@@ -7,8 +7,8 @@ pub mod detect;
 pub mod encoding;
 pub mod error_event;
 pub mod proxy;
-pub mod sse;
 pub mod server;
+pub mod sse;
 
 use std::convert::Infallible;
 
@@ -20,7 +20,7 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 
 use crate::config::ResolvedConfig;
-use crate::detect::{match_endpoint, probe_stream_flag, EndpointKind};
+use crate::detect::{accepts_event_stream, match_endpoint, probe_stream_flag, EndpointKind};
 use crate::encoding::{decode_bytes, parse_content_encoding};
 use crate::proxy::{build_client, proxy, proxy_buffered, ReqBody, RespBody};
 
@@ -62,7 +62,9 @@ pub async fn handle(
         let collected = match limited.collect().await {
             Ok(c) => c.to_bytes(),
             Err(e) => {
-                if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
                     return Ok(response_413());
                 }
                 return Ok(response_400());
@@ -70,6 +72,10 @@ pub async fn handle(
         };
 
         if kind == EndpointKind::GeminiStream {
+            return Ok(sse::handle_stream(cfg, client, parts, collected, kind).await);
+        }
+
+        if accepts_event_stream(&parts.headers) {
             return Ok(sse::handle_stream(cfg, client, parts, collected, kind).await);
         }
 

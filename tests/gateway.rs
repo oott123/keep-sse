@@ -354,6 +354,50 @@ async fn test_stream_true_chat_completions() {
 }
 
 #[tokio::test]
+async fn test_accept_event_stream_header_goes_sse() {
+    let (upstream, tx) = start_mock_raw(|_body, _path| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![
+                (
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n".to_vec(),
+                    0,
+                ),
+                (b"data: [DONE]\n\n".to_vec(), 50),
+            ],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 60).await;
+
+    // body 显式 stream:false，但带 Accept: text/event-stream 头 → 走 SSE 通路
+    let body = r#"{"model":"x","stream":false}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(), body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    // SSE 通路：上游 content-type 原样透传
+    assert_eq!(
+        headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str()),
+        Some("text/event-stream")
+    );
+    let body_str = String::from_utf8_lossy(&resp_body);
+    assert!(body_str.contains("data: {\"choices\""));
+    assert!(body_str.contains("[DONE]"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
 async fn test_stream_true_all_four_endpoints() {
     for (path, body, _expect_event) in &[
         (
@@ -793,9 +837,7 @@ fn dechunk(input: &[u8]) -> Vec<u8> {
             .position(|&b| b == b'\n')
             .map(|i| pos + i)
             .unwrap_or(input.len());
-        let size_str = std::str::from_utf8(&input[pos..line_end])
-            .unwrap()
-            .trim();
+        let size_str = std::str::from_utf8(&input[pos..line_end]).unwrap().trim();
         let size = usize::from_str_radix(size_str, 16).unwrap();
         pos = line_end + 1;
         if size == 0 {
@@ -854,7 +896,8 @@ async fn test_sse_downstream_gzip() {
     assert!(
         heartbeats >= 1,
         "expected >= 1 heartbeat, got {} in {:?}",
-        heartbeats, decompressed
+        heartbeats,
+        decompressed
     );
 
     tx.send(()).unwrap();
@@ -940,7 +983,11 @@ async fn test_probe_decompress_bomb_goes_transparent() {
 
     // 上游应收到原始压缩字节（透明代理）
     let rb = received_body.lock();
-    assert_eq!(&rb[..], &compressed[..], "upstream should receive original compressed bytes");
+    assert_eq!(
+        &rb[..],
+        &compressed[..],
+        "upstream should receive original compressed bytes"
+    );
 
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
@@ -977,7 +1024,10 @@ async fn test_error_event_reserialized_single_line() {
     // data: 行内无裸换行（紧凑重序列化）
     for line in s.lines() {
         if line.starts_with("data: ") {
-            assert!(!line.contains('\n'), "data: line should not contain newlines: {line}");
+            assert!(
+                !line.contains('\n'),
+                "data: line should not contain newlines: {line}"
+            );
         }
     }
     assert!(s.contains("[DONE]"));
@@ -995,7 +1045,10 @@ async fn test_heartbeat_not_injected_mid_event() {
             vec![("content-type", "text/event-stream".to_string())],
             0,
             vec![
-                (b"data: {\"choices\":[{\"delta\":{\"content\":\"hel".to_vec(), 0),
+                (
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hel".to_vec(),
+                    0,
+                ),
                 (b"lo\"}}]}\n\n".to_vec(), 2500),
             ],
         )
@@ -1017,7 +1070,8 @@ async fn test_heartbeat_not_injected_mid_event() {
     let event_start = s.find("data: {\"choices\":").unwrap();
     let event_fragment = &s[event_start..];
     // 心跳 ":\n\n 不应出现在事件中间
-    let mid_event_section = &event_fragment[..event_fragment.find("\n\n").unwrap_or(event_fragment.len())];
+    let mid_event_section =
+        &event_fragment[..event_fragment.find("\n\n").unwrap_or(event_fragment.len())];
     assert!(
         !mid_event_section.contains(":\n\n"),
         "heartbeat should not appear mid-event: {mid_event_section:?}"
@@ -1065,11 +1119,17 @@ async fn test_graceful_shutdown_drains_stream() {
     stream.read_to_end(&mut resp).await.unwrap();
     let s = String::from_utf8_lossy(&resp);
     assert!(s.contains("first"), "should contain first event: {s}");
-    assert!(s.contains("second"), "should contain second event after shutdown: {s}");
+    assert!(
+        s.contains("second"),
+        "should contain second event after shutdown: {s}"
+    );
 
     // shutdown 后新连接无法建立
     let new_conn = tokio::net::TcpStream::connect(gw).await;
-    assert!(new_conn.is_err(), "new connection after shutdown should fail");
+    assert!(
+        new_conn.is_err(),
+        "new connection after shutdown should fail"
+    );
 
     tx.send(()).unwrap();
 }

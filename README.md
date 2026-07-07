@@ -28,14 +28,15 @@ keep-sse --listen 0.0.0.0:8080 --upstream http://localhost:11434
 
 | 接口 | 路径后缀 | 方法 | 流式条件 |
 |---|---|---|---|
-| OpenAI Chat Completions | `/chat/completions` | POST | 请求体 `"stream": true` |
-| OpenAI Responses | `/responses` | POST | 请求体 `"stream": true` |
-| Anthropic Messages | `/messages` | POST | 请求体 `"stream": true` |
+| OpenAI Chat Completions | `/chat/completions` | POST | 请求体 `"stream": true`，或请求带 `Accept: text/event-stream` |
+| OpenAI Responses | `/responses` | POST | 请求体 `"stream": true`，或请求带 `Accept: text/event-stream` |
+| Anthropic Messages | `/messages` | POST | 请求体 `"stream": true`，或请求带 `Accept: text/event-stream` |
 | Gemini StreamGenerateContent | `:streamGenerateContent` | POST | 查询串含 `alt=sse` |
 
 - `/api/v1/chat/completions`、`/openai/api/v1/chat/completions` 均命中
 - `/v1/messages/batches`、`/v1/responses/{id}` 不命中
 - 非流式请求（`stream: false` 或缺省）走透明代理
+- 请求带 `Accept: text/event-stream` 头（精确匹配，去除前后空白后等于 `text/event-stream`；多值或带参数不命中）时跳过请求体探测，直接走 SSE 包装通路；Gemini 仍靠查询串 `alt=sse`。
 
 ## 错误事件格式
 

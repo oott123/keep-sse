@@ -422,14 +422,19 @@ mod tests {
     async fn decode_bytes_one_byte_over_errors() {
         let payload = b"x".repeat(256);
         let compressed = encode_once(Coding::Gzip, &payload).await;
-        let err = decode_bytes(Coding::Gzip, &compressed, 255).await.unwrap_err();
+        let err = decode_bytes(Coding::Gzip, &compressed, 255)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]
     async fn decode_bytes_identity_limit() {
         let payload = b"x".repeat(10);
-        assert_eq!(decode_bytes(Coding::Identity, &payload, 10).await.unwrap(), payload);
+        assert_eq!(
+            decode_bytes(Coding::Identity, &payload, 10).await.unwrap(),
+            payload
+        );
         assert!(decode_bytes(Coding::Identity, &payload, 9).await.is_err());
     }
 
