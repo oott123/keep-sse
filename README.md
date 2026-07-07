@@ -82,6 +82,56 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 - 透明代理通路：请求体和响应体原样透传，不解不压
 - SSE 包装通路：下行编码按客户端 `Accept-Encoding` 协商（`zstd > br > gzip > deflate > identity`），每个事件后 flush；上行 `Accept-Encoding` 原样透传客户端值
 
+## CPU Profiling
+
+keep-sse 可选编入 [pprof-rs](https://github.com/tikv/pprof-rs) 内嵌采样器，用于在不重启、不改动代码逻辑的前提下定位 CPU 热点。采样默认关闭，需在编译与运行时分别开启。
+
+### 构建 profiling 镜像
+
+Dockerfile 暴露 `PPROF` 构建参数。本地构建 profiling 镜像：
+
+```sh
+docker build --build-arg PPROF=true -t keep-sse:pprof .
+```
+
+CI 在常规镜像之外，会额外构建并推送带 `-pprof` 后缀的镜像（如 `ghcr.io/<repo>:main-pprof`、`:1.2.3-pprof`、`:sha-xxxxxxx-pprof`）。profiling 镜像与常规镜像同 Dockerfile、同 runtime 基础镜像，仅 cargo profile 与 feature 不同。
+
+也可本地用 cargo 直接构建：
+
+```sh
+cargo build --features pprof --profile pprof
+# 产物在 target/pprof/keep-sse
+```
+
+### 运行并触发 dump
+
+profiling 二进制通过环境变量激活采样、通过 `SIGUSR1` 触发 dump：
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `KEEP_SSE_PPROF` | （未设置）| 设为 `1` 启动 99Hz 采样；其它值/未设置则零开销不采样 |
+| `KEEP_SSE_PPROF_DIR` | `/tmp` | dump 报告输出目录 |
+
+容器内运行并触发一次 dump：
+
+```sh
+docker run -d -e KEEP_SSE_PPROF=1 -p 8080:8080 --name keep-sse keep-sse:pprof
+docker kill -s USR1 keep-sse
+docker cp keep-sse:/tmp/keep-sse-<ts>.svg ./   # 取出火焰图
+docker cp keep-sse:/tmp/keep-sse-<ts>.pb ./    # 取出 protobuf 报告
+```
+
+每次 `SIGUSR1` 在 `KEEP_SSE_PPROF_DIR` 下写两个文件：
+
+- `keep-sse-<unix_ts>.svg` —— 火焰图，浏览器直接打开。
+- `keep-sse-<unix_ts>.pb` —— 未压缩 protobuf，`go tool pprof keep-sse-<ts>.pb` 可读。
+
+dump 成功打印 `info` 日志（含路径），失败打印 `warn` 但不中止进程，可多次发送信号取多次快照。`SIGUSR1` 与 graceful shutdown 用的 `SIGTERM`/`SIGINT` 互不冲突。
+
+### 读取火焰图
+
+`.svg` 用浏览器打开即可：横轴为采样数（按调用栈聚合），纵轴为调用深度，宽栈段即 CPU 热点。`.pb` 可用 `go tool pprof` 做交互式分析（`top`、`list`、`web` 等子命令）。
+
 ## 已知取舍
 
 - SSE 包装通路下网关等待一个心跳间隔与上游响应赛跑：窗口内上游返回 2xx SSE 流式响应则透传上游状态码与响应头（含 `x-request-id`、限流头等）并桥接 body；窗口超时则网关先行发出 200，此后上游的响应头无法透传给客户端

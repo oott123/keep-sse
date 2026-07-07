@@ -20,6 +20,8 @@ async fn main() -> ExitCode {
     info!(listen = %cfg.listen, upstream = %cfg.upstream, "keep-sse starting");
 
     let client = create_client(&cfg);
+    #[cfg(feature = "pprof")]
+    keep_sse::pprof::start_if_enabled();
 
     let listener = match TcpListener::bind(cfg.listen).await {
         Ok(l) => l,

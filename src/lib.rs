@@ -9,6 +9,8 @@ pub mod error_event;
 pub mod proxy;
 pub mod server;
 pub mod sse;
+#[cfg(feature = "pprof")]
+pub mod pprof;
 
 use std::convert::Infallible;
 

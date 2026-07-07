@@ -5,12 +5,20 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /app
 
+# PPROF=true 构建带内嵌 CPU 采样器的 profiling 镜像；否则走默认 release。
+ARG PPROF=false
+
 # Pre-create target dir so cargo can write to it after we copy as root.
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked && \
-    cp target/release/keep-sse /keep-sse
+    if [ "$PPROF" = "true" ]; then \
+        cargo build --profile pprof --locked --features pprof && \
+        cp target/pprof/keep-sse /keep-sse; \
+    else \
+        cargo build --release --locked && \
+        cp target/release/keep-sse /keep-sse; \
+    fi
 
 # ---- runtime: distroless (glibc, not musl) ----
 FROM gcr.io/distroless/cc-debian12:nonroot

@@ -16,6 +16,10 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, pprof]
     steps:
       - name: Checkout
         uses: actions/checkout@v2
@@ -25,6 +29,7 @@ jobs:
         with:
           images: |
             ghcr.io/${{ github.repository }}
+          flavor: ${{ matrix.variant == 'pprof' && 'suffix=-pprof' || '' }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
@@ -50,5 +55,7 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: |
+            PPROF=${{ matrix.variant == 'pprof' && 'true' || 'false' }}
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,scope=${{ matrix.variant }},mode=max
