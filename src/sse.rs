@@ -7,8 +7,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::header::{
-    HeaderMap, HeaderValue, ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
-    CONTENT_TYPE, HOST,
+    HeaderMap, HeaderValue, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HOST,
 };
 use hyper::http::request::Parts;
 use hyper::{Request, Response, StatusCode};
@@ -117,13 +116,6 @@ pub async fn handle_stream(
     body: Bytes,
     kind: EndpointKind,
 ) -> Response<RespBody> {
-    // 协商下行编码。
-    let accept = parts
-        .headers
-        .get(ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok());
-    let down_coding = encoding::negotiate(accept);
-
     let interval = cfg.heartbeat_interval;
 
     // 构建上游请求并发起，与心跳间隔赛跑。
@@ -140,7 +132,7 @@ pub async fn handle_stream(
                     let is_sse = is_event_stream(headers);
                     if status.is_success() && is_sse {
                         if let Some(ce) = upstream_ce {
-                            passthrough_sse_response(resp, kind, down_coding, ce, interval).await
+                            passthrough_sse_response(resp, kind, ce, interval).await
                         } else {
                             proxy::passthrough_response(resp)
                         }
@@ -167,17 +159,8 @@ pub async fn handle_stream(
             );
             resp_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             resp_headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-            if let Some(val) = down_coding.header_value() {
-                resp_headers.insert(CONTENT_ENCODING, HeaderValue::from_static(val));
-            }
 
-            tokio::task::spawn(bridge(
-                kind,
-                down_coding,
-                interval,
-                tx,
-                upstream_fut,
-            ));
+            tokio::task::spawn(bridge(kind, interval, tx, upstream_fut));
 
             resp
         }
@@ -187,12 +170,11 @@ pub async fn handle_stream(
 /// 后台桥接：等待上游响应 → 解压 → SseWriter；心跳计时；错误事件。
 async fn bridge(
     kind: EndpointKind,
-    down_coding: Coding,
     interval: Duration,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
     upstream_fut: ResponseFuture,
 ) {
-    let mut writer = SseWriter::new(down_coding, tx);
+    let mut writer = SseWriter::new(tx);
     let mut heartbeat = Box::pin(tokio::time::sleep(interval));
     let mut upstream_fut = upstream_fut;
 
@@ -265,12 +247,11 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// 头透传 + 桥接 body：透传上游状态码与响应头（去掉 hop-by-hop、Content-Length，
-/// 替换 Content-Encoding 为下行编码），body 走现有解压 → SseWriter → 重编码通路。
+/// 头透传 + 桥接 body：透传上游状态码与响应头（去掉 hop-by-hop、Content-Length、
+/// Content-Encoding——下行一律 identity），body 走解压 → SseWriter（identity）通路。
 async fn passthrough_sse_response(
     resp: Response<Incoming>,
     kind: EndpointKind,
-    down_coding: Coding,
     upstream_ce: Coding,
     interval: Duration,
 ) -> Response<RespBody> {
@@ -279,11 +260,6 @@ async fn passthrough_sse_response(
     proxy::strip_hop_by_hop(&mut parts.headers);
     parts.headers.remove(CONTENT_LENGTH);
     parts.headers.remove(CONTENT_ENCODING);
-    if let Some(val) = down_coding.header_value() {
-        parts
-            .headers
-            .insert(CONTENT_ENCODING, HeaderValue::from_static(val));
-    }
     parts
         .headers
         .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
@@ -292,7 +268,7 @@ async fn passthrough_sse_response(
     let resp = Response::from_parts(parts, resp_body);
 
     tokio::task::spawn(async move {
-        let mut writer = SseWriter::new(down_coding, tx);
+        let mut writer = SseWriter::new(tx);
         let mut heartbeat = Box::pin(tokio::time::sleep(interval));
         handle_success(
             &mut writer,

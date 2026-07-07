@@ -1,20 +1,17 @@
-//! Content-Encoding 解析、Accept-Encoding 协商、流式编解码器包装。
+//! Content-Encoding 解析、上游流式解压、下行 SSE 写入端。
 
 use std::io;
-use std::pin::Pin;
 
 use async_compression::tokio::bufread::{
     BrotliDecoder as BrBuf, GzipDecoder as GzBuf, ZlibDecoder as DeflBuf, ZstdDecoder as ZstBuf,
 };
-use async_compression::tokio::write::{BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder};
 use bytes::Bytes;
 use futures_util::stream::{Stream, StreamExt};
 use hyper::body::{Body, Frame};
 use hyper::HeaderMap;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::io::{ReaderStream, StreamReader};
-
 /// 识别的内容编码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Coding {
@@ -26,16 +23,6 @@ pub enum Coding {
 }
 
 impl Coding {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Coding::Identity => "identity",
-            Coding::Gzip => "gzip",
-            Coding::Deflate => "deflate",
-            Coding::Br => "br",
-            Coding::Zstd => "zstd",
-        }
-    }
-
     /// 按 IANA token（不区分大小写）解析。未知返回 `None`。
     pub fn parse(s: &str) -> Option<Self> {
         if s.eq_ignore_ascii_case("identity") {
@@ -47,14 +34,6 @@ impl Coding {
             "br" => Some(Coding::Br),
             "zstd" => Some(Coding::Zstd),
             _ => None,
-        }
-    }
-
-    /// `Content-Encoding` 头值。`identity` 不写头（按 design 省略）。
-    pub fn header_value(self) -> Option<&'static str> {
-        match self {
-            Coding::Identity => None,
-            other => Some(other.as_str()),
         }
     }
 }
@@ -79,74 +58,6 @@ pub fn parse_content_encoding(headers: &HeaderMap) -> Option<Coding> {
         return None;
     }
     Coding::parse(parts[0])
-}
-
-/// 按客户端 `Accept-Encoding` 协商下行编码。
-///
-/// 优先级 `zstd > br > gzip > deflate > identity`；只识别 `;q=0` 为排除项，
-/// 不做完整 q 值排序。`identity` 默认始终可接受，除非显式 `identity;q=0`。
-pub fn negotiate(accept_encoding: Option<&str>) -> Coding {
-    let Some(val) = accept_encoding else {
-        return Coding::Identity;
-    };
-    if val.trim().is_empty() {
-        return Coding::Identity;
-    }
-
-    let (mut zstd, mut br, mut gzip, mut deflate, mut identity) = (None, None, None, None, None);
-    let mut wildcard = None;
-    for raw in val.split(',') {
-        let tok = raw.trim();
-        if tok.is_empty() {
-            continue;
-        }
-        let (name, q) = match tok.split_once(';') {
-            Some((n, rest)) => {
-                let qv: f32 = rest
-                    .trim()
-                    .strip_prefix("q=")
-                    .and_then(|q| q.trim().parse().ok())
-                    .unwrap_or(1.0);
-                (n.trim(), qv)
-            }
-            None => (tok, 1.0),
-        };
-        let allowed = q > 0.0;
-        if name == "*" {
-            wildcard = Some(allowed);
-        } else if name.eq_ignore_ascii_case("zstd") {
-            zstd = Some(allowed);
-        } else if name.eq_ignore_ascii_case("br") {
-            br = Some(allowed);
-        } else if name.eq_ignore_ascii_case("gzip") {
-            gzip = Some(allowed);
-        } else if name.eq_ignore_ascii_case("deflate") {
-            deflate = Some(allowed);
-        } else if name.eq_ignore_ascii_case("identity") {
-            identity = Some(allowed);
-        }
-    }
-
-    let accepted = |v: Option<bool>| v.unwrap_or_else(|| wildcard.unwrap_or(false));
-
-    if accepted(zstd) {
-        return Coding::Zstd;
-    }
-    if accepted(br) {
-        return Coding::Br;
-    }
-    if accepted(gzip) {
-        return Coding::Gzip;
-    }
-    if accepted(deflate) {
-        return Coding::Deflate;
-    }
-    let identity_ok = identity.unwrap_or(true);
-    if identity_ok {
-        return Coding::Identity;
-    }
-    // 客户端拒绝 identity 且不接受任何已知编码：退化为 identity（degraded）。
-    Coding::Identity
 }
 
 /// 一次性解压（探测与错误体读取用）。解压输出上限 `max_out` 字节，超出返回 `InvalidData`。
@@ -214,124 +125,29 @@ where
     }
 }
 
-/// 内部写入缓冲：`AsyncWrite` 实现，把字节追加到 `Vec<u8>`。
-pub struct VecSink(pub Vec<u8>);
-
-impl AsyncWrite for VecSink {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        self.0.extend_from_slice(buf);
-        std::task::Poll::Ready(Ok(buf.len()))
-    }
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-}
-
 type FrameTx = mpsc::Sender<Result<Frame<Bytes>, io::Error>>;
 
-/// 下行 SSE 写入端：按协商编码产出事件字节，每个事件后 flush。
-pub enum SseWriter {
-    Identity { tx: FrameTx },
-    Gzip(Box<GzipEncoder<VecSink>>, FrameTx),
-    Deflate(Box<ZlibEncoder<VecSink>>, FrameTx),
-    Br(Box<BrotliEncoder<VecSink>>, FrameTx),
-    Zstd(Box<ZstdEncoder<VecSink>>, FrameTx),
+/// 下行 SSE 写入端：以 identity 产出事件字节。
+pub struct SseWriter {
+    tx: FrameTx,
 }
 
 impl SseWriter {
-    pub fn new(coding: Coding, tx: FrameTx) -> Self {
-        match coding {
-            Coding::Identity => SseWriter::Identity { tx },
-            Coding::Gzip => SseWriter::Gzip(Box::new(GzipEncoder::new(VecSink(Vec::new()))), tx),
-            Coding::Deflate => {
-                SseWriter::Deflate(Box::new(ZlibEncoder::new(VecSink(Vec::new()))), tx)
-            }
-            Coding::Br => SseWriter::Br(Box::new(BrotliEncoder::new(VecSink(Vec::new()))), tx),
-            Coding::Zstd => SseWriter::Zstd(Box::new(ZstdEncoder::new(VecSink(Vec::new()))), tx),
-        }
+    pub fn new(tx: FrameTx) -> Self {
+        SseWriter { tx }
     }
 
-    /// 写出一个事件并 flush；客户端断开时返回错误。
+    /// 写出一个事件；客户端断开时返回错误。
     pub async fn write_event(&mut self, bytes: Bytes) -> io::Result<()> {
-        match self {
-            SseWriter::Identity { tx } => tx
-                .send(Ok(Frame::data(bytes)))
-                .await
-                .map_err(|_| io::Error::other("client gone")),
-            SseWriter::Gzip(enc, tx) => {
-                write_coded(enc, tx, bytes, |e| GzipEncoder::get_mut(e)).await
-            }
-            SseWriter::Deflate(enc, tx) => {
-                write_coded(enc, tx, bytes, |e| ZlibEncoder::get_mut(e)).await
-            }
-            SseWriter::Br(enc, tx) => {
-                write_coded(enc, tx, bytes, |e| BrotliEncoder::get_mut(e)).await
-            }
-            SseWriter::Zstd(enc, tx) => {
-                write_coded(enc, tx, bytes, |e| ZstdEncoder::get_mut(e)).await
-            }
-        }
-    }
-
-    /// 结束流：编码器收尾并 flush 残留字节，关闭下游通道。
-    pub async fn end(self) {
-        match self {
-            SseWriter::Identity { tx } => drop(tx),
-            SseWriter::Gzip(mut enc, tx) => {
-                finish_coded(&mut enc, tx, |e| GzipEncoder::get_mut(e)).await
-            }
-            SseWriter::Deflate(mut enc, tx) => {
-                finish_coded(&mut enc, tx, |e| ZlibEncoder::get_mut(e)).await
-            }
-            SseWriter::Br(mut enc, tx) => {
-                finish_coded(&mut enc, tx, |e| BrotliEncoder::get_mut(e)).await
-            }
-            SseWriter::Zstd(mut enc, tx) => {
-                finish_coded(&mut enc, tx, |e| ZstdEncoder::get_mut(e)).await
-            }
-        }
-    }
-}
-
-async fn write_coded<E, F>(enc: &mut E, tx: &FrameTx, bytes: Bytes, get_sink: F) -> io::Result<()>
-where
-    E: AsyncWrite + Unpin,
-    F: Fn(&mut E) -> &mut VecSink,
-{
-    enc.write_all(&bytes).await?;
-    enc.flush().await?;
-    let out = std::mem::take(&mut get_sink(enc).0);
-    if !out.is_empty() {
-        tx.send(Ok(Frame::data(Bytes::from(out))))
+        self.tx
+            .send(Ok(Frame::data(bytes)))
             .await
-            .map_err(|_| io::Error::other("client gone"))?;
+            .map_err(|_| io::Error::other("client gone"))
     }
-    Ok(())
-}
 
-/// 关闭编码器并刷出残留字节（gzip trailer 等）。
-async fn finish_coded<E, F>(enc: &mut E, tx: FrameTx, get_sink: F)
-where
-    E: AsyncWrite + Unpin,
-    F: Fn(&mut E) -> &mut VecSink,
-{
-    let _ = enc.shutdown().await;
-    let out = std::mem::take(&mut get_sink(enc).0);
-    if !out.is_empty() {
-        let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
+    /// 关闭下游通道。
+    pub async fn end(self) {
+        drop(self.tx);
     }
 }
 
@@ -340,28 +156,6 @@ mod tests {
     use super::*;
     use http::header::CONTENT_ENCODING;
     use http::HeaderMap;
-
-    #[test]
-    fn negotiate_priority() {
-        assert_eq!(negotiate(Some("zstd, br, gzip")), Coding::Zstd);
-        assert_eq!(negotiate(Some("br, gzip")), Coding::Br);
-        assert_eq!(negotiate(Some("gzip")), Coding::Gzip);
-        assert_eq!(negotiate(Some("deflate")), Coding::Deflate);
-        assert_eq!(negotiate(None), Coding::Identity);
-        assert_eq!(negotiate(Some("")), Coding::Identity);
-        // 通配符
-        assert_eq!(negotiate(Some("*")), Coding::Zstd);
-    }
-
-    #[test]
-    fn negotiate_q0_exclusion() {
-        // zstd 被排除，选 br
-        assert_eq!(negotiate(Some("zstd;q=0, br")), Coding::Br);
-        // 全排除通配
-        assert_eq!(negotiate(Some("*;q=0, identity")), Coding::Identity);
-        // identity 被排除且无其它可用 → 退化 identity
-        assert_eq!(negotiate(Some("identity;q=0")), Coding::Identity);
-    }
 
     #[test]
     fn parse_single_and_chained() {

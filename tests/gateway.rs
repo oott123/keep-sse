@@ -850,11 +850,9 @@ fn dechunk(input: &[u8]) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn test_sse_downstream_gzip() {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
+async fn test_sse_downstream_identity() {
     // 慢数据上游：延迟 2.5s（触发心跳），再发数据
+    // 客户端发 Accept-Encoding: gzip，但 SSE 下行一律 identity（不压缩、不写头）
     let (upstream, tx) = start_mock_raw(|_b, _p| {
         (
             200,
@@ -877,27 +875,25 @@ async fn test_sse_downstream_gzip() {
     let resp = send_raw(gw, &req).await;
     let (status, headers, resp_body) = parse_response(&resp);
     assert_eq!(status, 200);
+    // 下行不压缩：无 Content-Encoding 头
     assert_eq!(
+        headers.iter().find(|(k, _)| k == "content-encoding"),
+        None,
+        "expected no content-encoding header, got {:?}",
         headers
-            .iter()
-            .find(|(k, _)| k == "content-encoding")
-            .map(|(_, v)| v.as_str()),
-        Some("gzip")
     );
 
-    let decoded = dechunk(&resp_body);
-    let mut gz = GzDecoder::new(&decoded[..]);
-    let mut decompressed = String::new();
-    gz.read_to_string(&mut decompressed).unwrap();
-    // 心跳与数据事件都在
-    assert!(decompressed.contains("hello"));
-    assert!(decompressed.contains("world"));
-    let heartbeats = decompressed.matches(":\n\n").count();
+    let body = dechunk(&resp_body);
+    let body_str = String::from_utf8_lossy(&body);
+    // 心跳与数据事件都在，且为明文
+    assert!(body_str.contains("hello"));
+    assert!(body_str.contains("world"));
+    let heartbeats = body_str.matches(":\n\n").count();
     assert!(
         heartbeats >= 1,
         "expected >= 1 heartbeat, got {} in {:?}",
         heartbeats,
-        decompressed
+        body_str
     );
 
     tx.send(()).unwrap();
@@ -1132,4 +1128,129 @@ async fn test_graceful_shutdown_drains_stream() {
     );
 
     tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_sse_fast_path_identity() {
+    // 快路径：上游立即返回未压缩 SSE，客户端接受 gzip, zstd, br, deflate
+    // → SSE 下行一律 identity，无 Content-Encoding 头
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 60).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nAccept-Encoding: gzip, zstd, br, deflate\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.iter().find(|(k, _)| k == "content-encoding"),
+        None,
+        "expected no content-encoding header, got {:?}",
+        headers
+    );
+    assert_eq!(&dechunk(&resp_body)[..], b"data: hello\n\n");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_sse_fast_path_upstream_gzip_decoded_to_identity() {
+    // 快路径：上游返回真实 gzip 压缩 SSE（Content-Encoding: gzip）
+    // 网关解压后以 identity 明文转发 → 无 Content-Encoding 头，body == data: hello\n\n
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let payload = b"data: hello\n\n";
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(payload).unwrap();
+    let compressed = gz.finish().unwrap();
+
+    let (upstream, tx) = start_mock(move |_req| {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/event-stream")
+            .header("content-encoding", "gzip")
+            .body(Full::new(Bytes::from(compressed.clone())))
+            .unwrap()
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 60).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nAccept-Encoding: gzip, zstd, br, deflate\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.iter().find(|(k, _)| k == "content-encoding"),
+        None,
+        "expected no content-encoding header, got {:?}",
+        headers
+    );
+    assert_eq!(&dechunk(&resp_body)[..], b"data: hello\n\n");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_sse_slow_path_identity() {
+    // 慢路径：上游延迟超过心跳，网关自建 SSE 响应
+    // 客户端接受 gzip, zstd, br, deflate → SSE 下行一律 identity，无 Content-Encoding 头
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            2500,
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 1).await;
+
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip, zstd, br, deflate\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let resp = send_raw(gw, &req).await;
+    let (status, headers, resp_body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.iter().find(|(k, _)| k == "content-encoding"),
+        None,
+        "expected no content-encoding header, got {:?}",
+        headers
+    );
+    let body = dechunk(&resp_body);
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("hello"));
+    let heartbeats = body_str.matches(":\n\n").count();
+    assert!(
+        heartbeats >= 1,
+        "expected >= 1 heartbeat, got {} in {:?}",
+        heartbeats,
+        body_str
+    );
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
 }

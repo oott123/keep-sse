@@ -80,7 +80,7 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 - 支持 `gzip`、`deflate`、`br`、`zstd` 四种 Content-Encoding
 - 透明代理通路：请求体和响应体原样透传，不解不压
-- SSE 包装通路：下行编码按客户端 `Accept-Encoding` 协商（`zstd > br > gzip > deflate > identity`），每个事件后 flush；上行 `Accept-Encoding` 原样透传客户端值
+- SSE 包装通路：下行一律 identity（不压缩、不写 `Content-Encoding`）；上游响应体仍按其 `Content-Encoding` 解压以在事件边界注入心跳，解压后以明文转发；上行 `Accept-Encoding` 原样透传客户端值
 
 ## CPU Profiling
 
