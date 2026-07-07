@@ -203,7 +203,7 @@ async fn bridge(
                 if writer.write_event(Bytes::from_static(HEARTBEAT)).await.is_err() {
                     return; // 客户端已断开
                 }
-                heartbeat = Box::pin(tokio::time::sleep(interval));
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + interval);
             }
             result = &mut upstream_fut => {
                 break result;
@@ -347,7 +347,7 @@ async fn handle_success(
                 {
                     return;
                 }
-                *heartbeat = Box::pin(tokio::time::sleep(interval));
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + interval);
             }
             chunk = stream.next() => {
                 match chunk {
@@ -356,7 +356,7 @@ async fn handle_success(
                         if writer.write_event(bytes).await.is_err() {
                             return;
                         }
-                        *heartbeat = Box::pin(tokio::time::sleep(interval));
+                        heartbeat.as_mut().reset(tokio::time::Instant::now() + interval);
                     }
                     Some(Err(e)) => {
                         tracing::warn!(error = %e, "upstream stream error (sse)");
@@ -396,7 +396,7 @@ async fn handle_error(
                 if writer.write_event(Bytes::from_static(HEARTBEAT)).await.is_err() {
                     return;
                 }
-                *heartbeat = Box::pin(tokio::time::sleep(interval));
+                heartbeat.as_mut().reset(tokio::time::Instant::now() + interval);
             }
             result = &mut collect_fut => {
                 match result {
