@@ -38,11 +38,7 @@ pub async fn handle(
     client: GatewayClient,
     req: Request<Incoming>,
 ) -> Result<Response<RespBody>, Infallible> {
-    let method = req.method().clone();
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().map(|q| q.to_string());
-
-    if let Some(kind) = match_endpoint(&method, &path, query.as_deref()) {
+    if let Some(kind) = match_endpoint(req.method(), req.uri().path(), req.uri().query()) {
         let content_length = req
             .headers()
             .get(CONTENT_LENGTH)
@@ -52,7 +48,7 @@ pub async fn handle(
         if let Some(cl) = content_length {
             if cl > cfg.max_probe_body {
                 tracing::info!(
-                    path = %path,
+                    path = %req.uri().path(),
                     content_length = cl,
                     max_probe_body = cfg.max_probe_body,
                     "content-length exceeds max-probe-body; going transparent (no SSE keepalive)"

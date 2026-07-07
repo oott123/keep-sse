@@ -1,6 +1,5 @@
 //! Content-Encoding 解析、Accept-Encoding 协商、流式编解码器包装。
 
-use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 
@@ -94,8 +93,9 @@ pub fn negotiate(accept_encoding: Option<&str>) -> Coding {
         return Coding::Identity;
     }
 
-    let mut explicit: HashMap<String, bool> = HashMap::new();
-    let mut wildcard: Option<bool> = None;
+    let (mut zstd, mut br, mut gzip, mut deflate, mut identity) =
+        (None, None, None, None, None);
+    let mut wildcard = None;
     for raw in val.split(',') {
         let tok = raw.trim();
         if tok.is_empty() {
@@ -115,32 +115,34 @@ pub fn negotiate(accept_encoding: Option<&str>) -> Coding {
         let allowed = q > 0.0;
         if name == "*" {
             wildcard = Some(allowed);
-        } else {
-            explicit.insert(name.to_ascii_lowercase(), allowed);
+        } else if name.eq_ignore_ascii_case("zstd") {
+            zstd = Some(allowed);
+        } else if name.eq_ignore_ascii_case("br") {
+            br = Some(allowed);
+        } else if name.eq_ignore_ascii_case("gzip") {
+            gzip = Some(allowed);
+        } else if name.eq_ignore_ascii_case("deflate") {
+            deflate = Some(allowed);
+        } else if name.eq_ignore_ascii_case("identity") {
+            identity = Some(allowed);
         }
     }
 
-    let accepted = |coding: &str| -> bool {
-        match explicit.get(coding) {
-            Some(&allowed) => allowed,
-            None => wildcard.unwrap_or_default(),
-        }
-    };
+    let accepted = |v: Option<bool>| v.unwrap_or_else(|| wildcard.unwrap_or(false));
 
-    let identity_ok = *explicit.get("identity").unwrap_or(&true);
-
-    if accepted("zstd") {
+    if accepted(zstd) {
         return Coding::Zstd;
     }
-    if accepted("br") {
+    if accepted(br) {
         return Coding::Br;
     }
-    if accepted("gzip") {
+    if accepted(gzip) {
         return Coding::Gzip;
     }
-    if accepted("deflate") {
+    if accepted(deflate) {
         return Coding::Deflate;
     }
+    let identity_ok = identity.unwrap_or(true);
     if identity_ok {
         return Coding::Identity;
     }
