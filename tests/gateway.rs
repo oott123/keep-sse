@@ -1254,3 +1254,119 @@ async fn test_sse_slow_path_identity() {
     tx.send(()).unwrap();
     gw_tx.send(()).unwrap();
 }
+
+/// 读到响应头与第一个心跳为止；`deadline` 内读不到则测试失败。
+async fn read_head_and_first_heartbeat(
+    stream: &mut tokio::net::TcpStream,
+    deadline: Duration,
+) -> String {
+    let got = tokio::time::timeout(deadline, async {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !got.windows(3).any(|w| w == b":\n\n") {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0, "首个心跳之前连接就关闭了: {got:?}");
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    })
+    .await
+    .expect("deadline 内应收到响应头与首个心跳");
+    String::from_utf8_lossy(&got).into_owned()
+}
+
+/// 发一个 Anthropic 流式请求（Connection: close），返回连接。
+async fn open_anthropic_stream(gw: SocketAddr) -> tokio::net::TcpStream {
+    let body = r#"{"stream":true}"#;
+    let req = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = tokio::net::TcpStream::connect(gw).await.unwrap();
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream
+}
+
+#[tokio::test]
+async fn test_delayed_200_sent_at_window() {
+    // 窗口超时网关发 200 时，响应头与首个心跳应在窗口到期时发出，而不是再等一个间隔
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            5000, // 响应头延迟 5s，超过两个 2s 间隔
+            vec![(b"data: hello\n\n".to_vec(), 0)],
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    // 2s 窗口到期即应收到；不立即写心跳时第一个字节要到 4s。
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_secs(3)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert!(String::from_utf8_lossy(&rest).contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_passthrough_headers_sent_by_window_end() {
+    // 窗口内上游回了 SSE 响应头、数据迟迟不来：透传的响应头应在窗口截止时随首个心跳发出
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![
+                ("content-type", "text/event-stream".to_string()),
+                ("x-request-id", "req-early".to_string()),
+            ],
+            1500,                                      // 响应头在 2s 窗口内的 1.5s 到达
+            vec![(b"data: hello\n\n".to_vec(), 3500)], // 数据再过 3.5s 才到
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    // 窗口截止（2s）即应收到；按响应头到达后再等一个间隔算，第一个字节要到 3.5s。
+    let head = read_head_and_first_heartbeat(&mut stream, Duration::from_millis(2800)).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(head.contains("req-early"), "{head}");
+
+    let mut rest = Vec::new();
+    stream.read_to_end(&mut rest).await.unwrap();
+    assert!(String::from_utf8_lossy(&rest).contains("hello"));
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
+
+#[tokio::test]
+async fn test_passthrough_byte_identical_before_window_end() {
+    // 上游数据在窗口截止前到达：透传的响应体与上游逐字节相同，开头不插心跳
+    let (upstream, tx) = start_mock_raw(|_b, _p| {
+        (
+            200,
+            vec![("content-type", "text/event-stream".to_string())],
+            0,
+            vec![(b"data: hello\n\n".to_vec(), 300)], // 数据 0.3s 后到，早于 2s 窗口截止
+        )
+    })
+    .await;
+    let (gw, gw_tx) = start_gateway(upstream, 2).await;
+
+    let mut stream = open_anthropic_stream(gw).await;
+    let mut resp = Vec::new();
+    stream.read_to_end(&mut resp).await.unwrap();
+    let (status, _, body) = parse_response(&resp);
+    assert_eq!(status, 200);
+    assert_eq!(String::from_utf8_lossy(&dechunk(&body)), "data: hello\n\n");
+
+    tx.send(()).unwrap();
+    gw_tx.send(()).unwrap();
+}
