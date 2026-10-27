@@ -117,6 +117,7 @@ pub async fn handle_stream(
     kind: EndpointKind,
 ) -> Response<RespBody> {
     let interval = cfg.heartbeat_interval;
+    let late_type = cfg.anthropic_late_error_type.clone();
 
     // 构建上游请求并发起，与心跳间隔赛跑。
     let upstream_req = build_upstream_request(&cfg, parts, body);
@@ -160,7 +161,7 @@ pub async fn handle_stream(
             resp_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             resp_headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
 
-            tokio::task::spawn(bridge(kind, interval, tx, upstream_fut));
+            tokio::task::spawn(bridge(kind, interval, late_type, tx, upstream_fut));
 
             resp
         }
@@ -171,6 +172,7 @@ pub async fn handle_stream(
 async fn bridge(
     kind: EndpointKind,
     interval: Duration,
+    late_type: Option<String>,
     tx: mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>,
     upstream_fut: ResponseFuture,
 ) {
@@ -209,22 +211,34 @@ async fn bridge(
                     resp_body,
                 )
                 .await;
-            } else {
-                handle_error(
-                    &mut writer,
-                    &mut heartbeat,
-                    interval,
+            } else if let Some(error_body) = read_error_body(
+                &mut writer,
+                &mut heartbeat,
+                interval,
+                upstream_ce,
+                resp_body,
+            )
+            .await
+            {
+                let ev = error_event::build_late(
                     kind,
-                    status,
-                    upstream_ce,
-                    resp_body,
-                )
-                .await;
+                    Some(status),
+                    Some(&error_body),
+                    None,
+                    late_type.as_deref(),
+                );
+                let _ = writer.write_event(ev).await;
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "upstream request failed (sse)");
-            let ev = error_event::build(kind, None, None, Some(&e.to_string()));
+            let ev = error_event::build_late(
+                kind,
+                None,
+                None,
+                Some(&e.to_string()),
+                late_type.as_deref(),
+            );
             let _ = writer.write_event(ev).await;
         }
     }
@@ -353,16 +367,14 @@ async fn handle_success(
     }
 }
 
-/// 处理非 2xx 上游响应：读取错误体（解压，上限 1 MiB），构造错误事件。
-async fn handle_error(
+/// 读取非 2xx 上游响应的错误体（解压，上限 1 MiB），期间照常发心跳；客户端已断开时返回 `None`。
+async fn read_error_body(
     writer: &mut SseWriter,
     heartbeat: &mut std::pin::Pin<Box<tokio::time::Sleep>>,
     interval: Duration,
-    kind: EndpointKind,
-    status: StatusCode,
     upstream_ce: Option<Coding>,
     body: Incoming,
-) {
+) -> Option<Vec<u8>> {
     // 读取错误体（上限 MAX_ERROR_BODY）。
     let collect_fut = Limited::new(body, MAX_ERROR_BODY).collect();
     tokio::pin!(collect_fut);
@@ -370,7 +382,7 @@ async fn handle_error(
         tokio::select! {
             _ = &mut *heartbeat => {
                 if writer.write_event(Bytes::from_static(HEARTBEAT)).await.is_err() {
-                    return;
+                    return None;
                 }
                 heartbeat.as_mut().reset(tokio::time::Instant::now() + interval);
             }
@@ -384,15 +396,12 @@ async fn handle_error(
     };
 
     // 解压错误体（如需）。
-    let error_body: Vec<u8> = match upstream_ce {
+    Some(match upstream_ce {
         Some(Coding::Identity) | None => collected.to_vec(),
         Some(ce) => encoding::decode_bytes(ce, &collected, MAX_ERROR_BODY)
             .await
             .unwrap_or_else(|_| collected.to_vec()),
-    };
-
-    let ev = error_event::build(kind, Some(status), Some(&error_body), None);
-    let _ = writer.write_event(ev).await;
+    })
 }
 
 /// 构建上游请求：过滤 hop-by-hop、改写 Host 与 URI、body 为原始 Bytes。

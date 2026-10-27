@@ -31,6 +31,11 @@ pub struct Config {
     /// 收到 SIGTERM/SIGINT 后等待存量连接完成的时长（秒），超时强制退出。
     #[arg(long, env = "KEEP_SSE_SHUTDOWN_TIMEOUT", default_value_t = 30)]
     pub shutdown_timeout: u64,
+
+    /// 网关已先回 200 之后，上游 5xx 或请求失败时，Anthropic 错误事件改写成的 `error.type`；
+    /// 不设则按现有映射。
+    #[arg(long, env = "KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE")]
+    pub anthropic_late_error_type: Option<String>,
 }
 
 /// 校验后的运行时配置。`upstream` 已解析为 `Uri`。
@@ -43,6 +48,7 @@ pub struct ResolvedConfig {
     pub connect_timeout: std::time::Duration,
     pub max_probe_body: usize,
     pub shutdown_timeout: std::time::Duration,
+    pub anthropic_late_error_type: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -73,6 +79,20 @@ impl ResolvedConfig {
             ));
         }
 
+        // 空白视同未设置；非空值只允许 `[a-z_]+`（Anthropic 错误类型的写法）。
+        let anthropic_late_error_type =
+            match cfg.anthropic_late_error_type.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(t) if t.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') => {
+                    Some(t.to_owned())
+                }
+                Some(t) => {
+                    return Err(format!(
+                        "invalid --anthropic-late-error-type `{t}`: expected [a-z_]+"
+                    ))
+                }
+            };
+
         Ok(Self {
             listen: cfg.listen,
             upstream,
@@ -81,6 +101,7 @@ impl ResolvedConfig {
             connect_timeout: std::time::Duration::from_secs(cfg.connect_timeout),
             max_probe_body: cfg.max_probe_body,
             shutdown_timeout: std::time::Duration::from_secs(cfg.shutdown_timeout),
+            anthropic_late_error_type,
         })
     }
 }
@@ -94,5 +115,45 @@ pub fn parse_or_exit() -> Result<ResolvedConfig, ExitCode> {
             eprintln!("keep-sse: {e}");
             Err(ExitCode::FAILURE)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve_late(value: &str) -> Result<ResolvedConfig, String> {
+        let cfg = Config::try_parse_from([
+            "keep-sse",
+            "--upstream",
+            "http://127.0.0.1:9",
+            "--anthropic-late-error-type",
+            value,
+        ])
+        .expect("命令行应能被 clap 解析");
+        ResolvedConfig::parse(cfg)
+    }
+
+    #[test]
+    fn late_error_type_rejects_invalid() {
+        for value in ["overloaded error", "Overloaded"] {
+            let err = resolve_late(value).expect_err(value);
+            assert!(err.contains("--anthropic-late-error-type"), "{err}");
+        }
+    }
+
+    #[test]
+    fn late_error_type_blank_is_none() {
+        let rc = resolve_late("  ").unwrap();
+        assert_eq!(rc.anthropic_late_error_type, None);
+    }
+
+    #[test]
+    fn late_error_type_valid_is_trimmed() {
+        let rc = resolve_late(" overloaded_error ").unwrap();
+        assert_eq!(
+            rc.anthropic_late_error_type.as_deref(),
+            Some("overloaded_error")
+        );
     }
 }

@@ -5,6 +5,8 @@
 //!
 //! 关键规则：上游体若能解析出该 API 的标准错误 JSON，则整体原样嵌入（不改写字段）；
 //! 否则按下述模板合成，`message` 取错误体原文（截断至 4 KiB，无法解码时用状态行描述）。
+//! 唯一例外是 [`build_late`]：配置了 `--anthropic-late-error-type` 时，网关先回 200 之后的
+//! Anthropic 5xx/请求失败改写 `error.type`；嵌入的上游 JSON 只改这一个字段。
 
 use bytes::Bytes;
 use hyper::StatusCode;
@@ -23,8 +25,31 @@ pub fn build(
     match kind {
         EndpointKind::ChatCompletions => build_chat(status, body, reason),
         EndpointKind::Responses => build_responses(status, body, reason),
-        EndpointKind::AnthropicMessages => build_anthropic(status, body, reason),
+        EndpointKind::AnthropicMessages => build_anthropic(status, body, reason, None),
         EndpointKind::GeminiStream => build_gemini(status, body, reason),
+    }
+}
+
+/// 网关已先回 200 之后（`bridge` 路径）的错误事件。
+///
+/// `anthropic_type` 已设、接口为 Anthropic Messages、且上游为 5xx 或请求失败（`status` 为 `None`）时，
+/// 把 `error.type` 改写为 `anthropic_type`（嵌入的上游 JSON 只改这一个字段）；其余情况与 [`build`] 完全相同。
+pub fn build_late(
+    kind: EndpointKind,
+    status: Option<StatusCode>,
+    body: Option<&[u8]>,
+    reason: Option<&str>,
+    anthropic_type: Option<&str>,
+) -> Bytes {
+    let server_side = status.is_none_or(|s| s.is_server_error());
+    match anthropic_type {
+        Some(t) if kind == EndpointKind::AnthropicMessages && server_side => build_anthropic(
+            status.unwrap_or(StatusCode::BAD_GATEWAY),
+            body,
+            reason,
+            Some(t),
+        ),
+        _ => build(kind, status, body, reason),
     }
 }
 
@@ -171,16 +196,36 @@ fn responses_code(status: StatusCode) -> &'static str {
 
 // ===== Anthropic Messages =====
 
-fn build_anthropic(status: StatusCode, body: Option<&[u8]>, reason: Option<&str>) -> Bytes {
+/// `etype_override` 为 Some 时，`error.type` 一律取该值（嵌入的上游 JSON 也就地改写）。
+fn build_anthropic(
+    status: StatusCode,
+    body: Option<&[u8]>,
+    reason: Option<&str>,
+    etype_override: Option<&str>,
+) -> Bytes {
     let mut s = String::from("event: error\ndata: ");
-    if let Some(b) = body.filter(|b| !b.is_empty()) {
-        if let Some(value) = parse_anthropic_error(b) {
+    if let Some(mut value) = body
+        .filter(|b| !b.is_empty())
+        .and_then(parse_anthropic_error)
+    {
+        // 改写时 `error` 须为对象；否则退回下面的模板合成。
+        let embeddable = match etype_override {
+            None => true,
+            Some(t) => match value.get_mut("error").and_then(|e| e.as_object_mut()) {
+                Some(e) => {
+                    e.insert("type".to_string(), t.into());
+                    true
+                }
+                None => false,
+            },
+        };
+        if embeddable {
             s.push_str(&serde_json::to_string(&value).expect("json serializable"));
             s.push_str("\n\n");
             return Bytes::from(s);
         }
     }
-    let etype = anthropic_error_type(status);
+    let etype = etype_override.unwrap_or_else(|| anthropic_error_type(status));
     let msg = message(body, reason, status);
     let payload = serde_json::json!({
         "type": "error",
@@ -411,5 +456,127 @@ mod tests {
         // The é (2 bytes) at position MAX_MSG-1 would overflow; cut backs off to MAX_MSG-1 ("a")
         assert_eq!(out.len(), MAX_MSG - 1);
         assert!(out.is_char_boundary(out.len()));
+    }
+
+    // ===== build_late =====
+
+    const SUB2API_502: &[u8] =
+        br#"{"type":"error","error":{"type":"upstream_error","message":"Upstream request failed"}}"#;
+    const LATE: Option<&str> = Some("overloaded_error");
+
+    /// 断言输出为一行 `event: error` 加一行 `data:`，返回 data 的 JSON。
+    fn anthropic_event_json(out: &[u8]) -> serde_json::Value {
+        let s = std::str::from_utf8(out).unwrap();
+        let (event, rest) = s.split_once('\n').unwrap();
+        assert_eq!(event, "event: error");
+        let data = rest
+            .strip_prefix("data: ")
+            .and_then(|d| d.strip_suffix("\n\n"))
+            .unwrap();
+        assert!(!data.contains('\n'), "data: 行内不应有换行: {data}");
+        serde_json::from_str(data).unwrap()
+    }
+
+    #[test]
+    fn late_sub2api_502_rewritten() {
+        let out = build_late(
+            EndpointKind::AnthropicMessages,
+            s(502),
+            Some(SUB2API_502),
+            None,
+            LATE,
+        );
+        let v = anthropic_event_json(&out);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        assert_eq!(v["error"]["message"], "Upstream request failed");
+    }
+
+    #[test]
+    fn late_connect_failure_rewritten() {
+        let reason = Some("client error (Connect)");
+        let out = build_late(EndpointKind::AnthropicMessages, None, None, reason, LATE);
+        let v = anthropic_event_json(&out);
+        let orig =
+            anthropic_event_json(&build(EndpointKind::AnthropicMessages, None, None, reason));
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        assert_eq!(v["error"]["message"], orig["error"]["message"]);
+    }
+
+    #[test]
+    fn late_plain_5xx_body_rewritten() {
+        let out = build_late(
+            EndpointKind::AnthropicMessages,
+            s(503),
+            Some(b"busy"),
+            None,
+            LATE,
+        );
+        let v = anthropic_event_json(&out);
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        assert_eq!(v["error"]["message"], "busy");
+    }
+
+    #[test]
+    fn late_non_object_error_field_rewritten() {
+        // `error` 不是对象时无法就地改写 type，按模板合成，message 取错误体原文。
+        let body = br#"{"type":"error","error":"boom"}"#;
+        let out = build_late(
+            EndpointKind::AnthropicMessages,
+            s(500),
+            Some(body),
+            None,
+            LATE,
+        );
+        let v = anthropic_event_json(&out);
+        assert_eq!(v["error"]["type"], "overloaded_error");
+        assert_eq!(v["error"]["message"], std::str::from_utf8(body).unwrap());
+    }
+
+    #[test]
+    fn late_non_5xx_unchanged() {
+        for code in [307, 400, 401, 429] {
+            let late = build_late(
+                EndpointKind::AnthropicMessages,
+                s(code),
+                Some(SUB2API_502),
+                None,
+                LATE,
+            );
+            let orig = build(
+                EndpointKind::AnthropicMessages,
+                s(code),
+                Some(SUB2API_502),
+                None,
+            );
+            assert_eq!(late, orig, "status {code}");
+        }
+    }
+
+    #[test]
+    fn late_other_kinds_unchanged() {
+        for kind in [
+            EndpointKind::ChatCompletions,
+            EndpointKind::Responses,
+            EndpointKind::GeminiStream,
+        ] {
+            let late = build_late(kind, s(502), Some(SUB2API_502), None, LATE);
+            assert_eq!(
+                late,
+                build(kind, s(502), Some(SUB2API_502), None),
+                "{kind:?}"
+            );
+            let late = build_late(kind, None, None, Some("refused"), LATE);
+            assert_eq!(late, build(kind, None, None, Some("refused")), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn late_none_unchanged() {
+        let kind = EndpointKind::AnthropicMessages;
+        let late = build_late(kind, s(502), Some(SUB2API_502), None, None);
+        assert_eq!(late, build(kind, s(502), Some(SUB2API_502), None));
+        let late = build_late(kind, None, None, Some("refused"), None);
+        assert_eq!(late, build(kind, None, None, Some("refused")));
     }
 }

@@ -17,6 +17,7 @@ LLM 流式响应中，上游在首包前或流中间可能有长时间停顿（�
 | `--heartbeat-interval` | `KEEP_SSE_HEARTBEAT_INTERVAL` | `60` | 空闲保活间隔（秒） |
 | `--connect-timeout` | `KEEP_SSE_CONNECT_TIMEOUT` | `10` | 上游 TCP 连接超时（秒） |
 | `--max-probe-body` | `KEEP_SSE_MAX_PROBE_BODY` | `33554432` | 流式探测请求体缓冲上限（字节） |
+| `--anthropic-late-error-type` | `KEEP_SSE_ANTHROPIC_LATE_ERROR_TYPE` | 不设 | 网关先回 200 之后，上游返回 5xx 或请求失败（如连上后未回响应头就断开）时，Anthropic 错误事件改写成的 `error.type`（如 `overloaded_error`），只允许 `[a-z_]+`；见「错误事件格式」 |
 
 ```sh
 keep-sse --listen 0.0.0.0:8080 --upstream http://localhost:11434
@@ -67,6 +68,10 @@ data: {"type":"error","error":{"type":"<type>","message":"<message>"}}
 
 ```
 
+设置 `--anthropic-late-error-type` 后，网关已先回 200（窗口超时）、随后上游返回 5xx 或请求失败（`status` 为空，如连上后未回响应头就断开）时，`error.type` 一律改写为该值：上游体是标准错误 JSON 时只改这一个字段，其余字段原样保留；否则按模板合成，`message` 与不设时相同。窗口内的响应（含窗口内的连接失败，它以 502 透传）、4xx（含 429）、2xx 流中途出错、不可解码的 Content-Encoding 以及其他三种接口均不受影响。
+
+用途：Claude Code 收到 200 之后的流内 `overloaded_error` 时会重新发起流式请求（有次数上限），而收到其他流内错误时会立即改用非流式请求；非流式请求走透明代理、没有心跳，长回答在有读超时的反向代理（如 Cloudflare 的 120 s）后容易超时。设为 `overloaded_error` 可让这类迟到的上游故障继续走流式重试。
+
 ### Gemini（alt=sse）
 
 ```
@@ -74,7 +79,7 @@ data: {"error":{"code":<http_status>,"message":"<message>","status":"<status>"}}
 
 ```
 
-上游体若能解析出该 API 的标准错误 JSON，则原样嵌入（不改写字段）。
+上游体若能解析出该 API 的标准错误 JSON，则原样嵌入（不改写字段；`--anthropic-late-error-type` 是唯一例外）。
 
 ## 压缩
 
